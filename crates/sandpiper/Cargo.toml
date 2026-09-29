@@ -1,0 +1,11 @@
+[package]
+name = "sandpiper"
+version = "0.0.1"
+description = "Self-hosted microVM machines for AI agents and apps. Early development."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["microvm", "sandbox", "kvm", "agents"]
+categories = ["virtualization"]
+include = ["src/**", "README.md"]
