@@ -19,6 +19,8 @@ const CHUNK: usize = 32 * 1024;
 /// background. Its output after that point is not the command's.
 const PUMP_GRACE: Duration = Duration::from_millis(200);
 const POLL: Duration = Duration::from_millis(5);
+/// Stdin frames queued between the connection and the child, at most.
+const STDIN_QUEUE: usize = 8;
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 type Writer = Arc<Mutex<File>>;
@@ -138,7 +140,9 @@ fn handle(conn: File) -> io::Result<()> {
     };
 
     let hangup = Arc::new(AtomicBool::new(false));
-    let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>();
+    // Bounded, so a child that reads slowly pushes back on the host instead
+    // of the guest buffering all of its input in memory.
+    let (stdin_tx, stdin_rx) = mpsc::sync_channel::<Vec<u8>>(STDIN_QUEUE);
     spawn_reader(reader, stdin_tx, Arc::clone(&hangup));
     spawn_stdin_writer(child.stdin.take().expect("piped"), stdin_rx);
     let out = Pump::spawn(child.stdout.take().expect("piped"), &writer, Frame::Stdout);
@@ -157,7 +161,7 @@ fn handle(conn: File) -> io::Result<()> {
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
 
     // Exit must not overtake output. Wait until each stream has ended, or
-    // has sat idle in `read` (not mid-send) for the grace period.
+    // has sat blocked in `read` for the grace period (then it is abandoned).
     let since_exit = Instant::now();
     loop {
         if hangup.load(Ordering::Relaxed) {
@@ -165,17 +169,20 @@ fn handle(conn: File) -> io::Result<()> {
             err.abandon();
             return Err(io::Error::other("host hung up before Exit"));
         }
-        let settled = |p: &Pump| p.finished() || p.idle_for() >= PUMP_GRACE;
-        if since_exit.elapsed() >= PUMP_GRACE && settled(&out) && settled(&err) {
-            break;
-        }
         if out.finished() && err.finished() {
             break;
         }
+        if since_exit.elapsed() >= PUMP_GRACE {
+            // Evaluate both every round: settling one may abandon it.
+            let (o, e) = (out.settle(), err.settle());
+            if o && e {
+                break;
+            }
+        }
         thread::sleep(POLL);
     }
-    let stdout_truncated = out.finish()?;
-    let stderr_truncated = err.finish()?;
+    let (stdout, stderr) = (out.finish(), err.finish());
+    let (stdout_truncated, stderr_truncated) = (stdout?, stderr?);
     send(
         &writer,
         &Frame::Exit(ExitStatus {
@@ -206,7 +213,7 @@ fn wait_or_hangup(
     }
 }
 
-fn spawn_reader(mut reader: File, stdin_tx: mpsc::Sender<Vec<u8>>, hangup: Arc<AtomicBool>) {
+fn spawn_reader(mut reader: File, stdin_tx: mpsc::SyncSender<Vec<u8>>, hangup: Arc<AtomicBool>) {
     thread::spawn(move || {
         let mut stdin_tx = Some(stdin_tx);
         loop {
@@ -214,10 +221,19 @@ fn spawn_reader(mut reader: File, stdin_tx: mpsc::Sender<Vec<u8>>, hangup: Arc<A
                 Ok(Some(Frame::Stdin(data))) if stdin_tx.is_some() => {
                     if data.is_empty() {
                         stdin_tx = None; // end of input: the writer closes the pipe
-                    } else if let Some(tx) = &stdin_tx {
-                        let _ = tx.send(data);
+                    } else if let Some(tx) = &stdin_tx
+                        && tx.send(data).is_err()
+                    {
+                        // The child stopped taking input; drop the rest but
+                        // keep reading so a hang-up is still noticed.
+                        stdin_tx = None;
                     }
                 }
+                Ok(Some(Frame::Stdin(_))) => {} // input after the child stopped reading
+                // Known limit: while blocked on a full queue (a live child
+                // that is not reading stdin) a hang-up is not seen until the
+                // child exits. The host destroys the VM in M0; M1 replaces
+                // this with poll(2).
                 // End of stream, an error, or anything unexpected: the host
                 // is gone or broken. Either way the exchange is over.
                 _ => {
@@ -251,10 +267,13 @@ struct PumpState {
     /// Taken away on abandon, so a pump left blocked in `read` by a
     /// background process holds no reference to the connection.
     writer: Option<Writer>,
-    sending: bool,
+    /// True while the pump is blocked in `read` with nothing in hand.
+    in_read: bool,
+    /// When the pump last finished a read or a send.
     last_activity: Instant,
-    /// Set when the stream ends: whether the cap was hit, or the error.
-    result: Option<io::Result<bool>>,
+    truncated: bool,
+    /// Set when the stream ends; `Err` if reading or sending failed.
+    result: Option<io::Result<()>>,
 }
 
 impl Pump {
@@ -265,8 +284,9 @@ impl Pump {
     ) -> Self {
         let state = Arc::new(Mutex::new(PumpState {
             writer: Some(Arc::clone(writer)),
-            sending: false,
+            in_read: false,
             last_activity: Instant::now(),
+            truncated: false,
             result: None,
         }));
         let s = Arc::clone(&state);
@@ -283,27 +303,39 @@ impl Pump {
         self.state.lock().expect("pump lock").result.is_some()
     }
 
-    /// How long the pump has been waiting in `read`; zero while it is sending.
-    fn idle_for(&self) -> Duration {
-        let st = self.state.lock().expect("pump lock");
-        if st.sending {
-            Duration::ZERO
-        } else {
-            st.last_activity.elapsed()
+    /// True once the stream has ended, or — checked and acted on under one
+    /// lock — has been blocked in `read` for the grace period, in which case
+    /// it is abandoned. A pump holding data or mid-send is never abandoned.
+    ///
+    /// Residual window: a pump whose `read` returned data but which has not
+    /// yet retaken the lock still reads as blocked. That data arrived at least
+    /// the grace period after the command exited, so it came from something
+    /// the command left running, and dropping it is the documented behaviour.
+    fn settle(&self) -> bool {
+        let mut st = self.state.lock().expect("pump lock");
+        if st.result.is_some() {
+            return true;
         }
+        if st.in_read && st.last_activity.elapsed() >= PUMP_GRACE {
+            st.writer = None;
+            return true;
+        }
+        false
     }
 
     fn abandon(&self) {
         self.state.lock().expect("pump lock").writer = None;
     }
 
-    /// The pump's result if it ended; otherwise abandon it. An abandoned
-    /// stream is not marked truncated: what it would still have carried came
-    /// from a background process after the command exited.
+    /// Whether the stream hit the cap. An abandoned stream keeps the flag it
+    /// had earned before it was abandoned.
     fn finish(self) -> io::Result<bool> {
         let mut st = self.state.lock().expect("pump lock");
         st.writer = None;
-        st.result.take().unwrap_or(Ok(false))
+        match st.result.take() {
+            Some(Err(e)) => Err(e),
+            _ => Ok(st.truncated),
+        }
     }
 }
 
@@ -311,43 +343,40 @@ fn forward<R: Read>(
     mut src: R,
     state: &Mutex<PumpState>,
     wrap: fn(Vec<u8>) -> Frame,
-) -> io::Result<bool> {
+) -> io::Result<()> {
     let mut sent = 0usize;
-    let mut truncated = false;
     let mut buf = vec![0u8; CHUNK];
     loop {
-        let n = match src.read(&mut buf) {
-            Ok(0) => return Ok(truncated),
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        let room = DEFAULT_OUTPUT_CAP.saturating_sub(sent);
-        if n > room {
-            truncated = true;
-        }
-        let take = n.min(room);
-        if take == 0 {
-            continue;
-        }
+        state.lock().expect("pump lock").in_read = true;
+        let read = src.read(&mut buf);
         let writer = {
             let mut st = state.lock().expect("pump lock");
-            match st.writer.clone() {
-                Some(w) => {
-                    st.sending = true;
-                    w
+            st.in_read = false;
+            st.last_activity = Instant::now();
+            let n = match read {
+                Ok(0) => return Ok(()),
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            let take = n.min(DEFAULT_OUTPUT_CAP.saturating_sub(sent));
+            if take < n {
+                st.truncated = true;
+            }
+            match (&st.writer, take) {
+                (Some(w), 1..) => {
+                    sent += take;
+                    Some((Arc::clone(w), take))
                 }
-                None => continue, // abandoned: drain and discard
+                _ => None, // over the cap, or abandoned: drain and discard
             }
         };
-        let res = send(&writer, &wrap(buf[..take].to_vec()));
-        drop(writer);
-        let mut st = state.lock().expect("pump lock");
-        st.sending = false;
-        st.last_activity = Instant::now();
-        drop(st);
-        res?;
-        sent += take;
+        if let Some((w, take)) = writer {
+            let res = send(&w, &wrap(buf[..take].to_vec()));
+            drop(w);
+            state.lock().expect("pump lock").last_activity = Instant::now();
+            res?;
+        }
     }
 }
 

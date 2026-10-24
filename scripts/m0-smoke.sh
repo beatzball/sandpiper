@@ -24,6 +24,10 @@ check "slow reader gets every byte before Exit" "900000" \
   "$(run --timeout 20 -- head -c 900000 /dev/zero 2>/dev/null | (sleep 2; wc -c) | tr -d ' ')"
 check "output cap reported" "sandpiper: output was truncated at the per-stream cap" \
   "$(run -- head -c 3000000 /dev/zero 2>&1 >/dev/null)"
+check "cap reported when a background process holds stdout" "sandpiper: output was truncated at the per-stream cap" \
+  "$(run --timeout 20 -- sh -c 'head -c 3000000 /dev/zero; sleep 30 &' 2>&1 >/dev/null)"
+check "big stdin to a slow reader does not exhaust guest memory" "629145600" \
+  "$(head -c 629145600 /dev/zero | run --stdin --timeout 120 -- sh -c 'sleep 3; wc -c' 2>/dev/null | tr -d ' ')"
 run --timeout 2 -- sleep 10 2>/dev/null; check "timeout exit" "124" "$?"
 check "no network"        "no-network" \
   "$(run -- sh -c 'wget -q -T 3 -O- http://1.1.1.1 >/dev/null 2>&1 && echo reachable || echo no-network' 2>/dev/null)"

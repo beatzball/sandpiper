@@ -150,10 +150,16 @@ pub fn write_frame<W: Write>(w: &mut W, frame: &Frame) -> io::Result<()> {
 /// frame starts; a stream that ends mid-frame is an error.
 pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Option<Frame>> {
     let mut len = [0u8; 4];
-    match r.read(&mut len[..1])? {
-        0 => return Ok(None),
-        _ => r.read_exact(&mut len[1..])?,
+    loop {
+        match r.read(&mut len[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            // Nothing consumed yet, so retrying cannot desync the stream.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
     }
+    r.read_exact(&mut len[1..])?;
     let len = u32::from_be_bytes(len) as usize;
     if len == 0 || len - 1 > MAX_FRAME {
         return Err(invalid(format!("frame length {len} out of range")));
