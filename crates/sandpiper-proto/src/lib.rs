@@ -73,6 +73,19 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 }
 
 impl Frame {
+    /// The frame's type name, safe to log: it never includes guest data.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Frame::Ready { .. } => "Ready",
+            Frame::Exec(_) => "Exec",
+            Frame::Stdin(_) => "Stdin",
+            Frame::Stdout(_) => "Stdout",
+            Frame::Stderr(_) => "Stderr",
+            Frame::Exit(_) => "Exit",
+            Frame::Error(_) => "Error",
+        }
+    }
+
     fn encode_payload(&self) -> io::Result<(u8, Vec<u8>)> {
         Ok(match self {
             Frame::Ready { version } => (T_READY, version.to_be_bytes().to_vec()),

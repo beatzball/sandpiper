@@ -2,9 +2,10 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use sandpiper_proto::{
     DEFAULT_OUTPUT_CAP, ExecRequest, ExitStatus, Frame, GUEST_PORT, PROTOCOL_VERSION, read_frame,
@@ -12,6 +13,8 @@ use sandpiper_proto::{
 };
 
 const CHUNK: usize = 32 * 1024;
+/// How long to wait for output pipes to close after the command exits.
+const PUMP_GRACE: Duration = Duration::from_millis(200);
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 pub fn serve() -> io::Result<()> {
@@ -22,6 +25,7 @@ pub fn serve() -> io::Result<()> {
         if let Err(e) = handle(conn) {
             eprintln!("sandpiper-guest: connection failed: {e}");
         }
+        reap_orphans();
     }
 }
 
@@ -87,7 +91,12 @@ fn handle(conn: File) -> io::Result<()> {
 
     let req = match read_frame(&mut reader)? {
         Some(Frame::Exec(req)) => req,
-        Some(other) => return Err(io::Error::other(format!("expected Exec, got {other:?}"))),
+        Some(other) => {
+            return Err(io::Error::other(format!(
+                "expected Exec, got {}",
+                other.kind()
+            )));
+        }
         None => return Ok(()),
     };
 
@@ -115,36 +124,46 @@ fn handle(conn: File) -> io::Result<()> {
         }
     };
 
-    let stdout = child.stdout.take().expect("piped");
-    let stderr = child.stderr.take().expect("piped");
-    let out = pump(stdout, Arc::clone(&writer), Frame::Stdout);
-    let err = pump(stderr, Arc::clone(&writer), Frame::Stderr);
+    let (done_tx, done_rx) = mpsc::channel();
+    pump(
+        child.stdout.take().expect("piped"),
+        Arc::clone(&writer),
+        Stream::Stdout,
+        done_tx.clone(),
+    );
+    pump(
+        child.stderr.take().expect("piped"),
+        Arc::clone(&writer),
+        Stream::Stderr,
+        done_tx,
+    );
 
-    // Feed stdin until the host sends the empty end-of-input frame. A child
-    // that exits early makes writes fail; that is not an error here.
-    let mut stdin = child.stdin.take();
-    loop {
-        match read_frame(&mut reader)? {
-            Some(Frame::Stdin(data)) if data.is_empty() => break,
-            Some(Frame::Stdin(data)) => {
-                if let Some(s) = stdin.as_mut()
-                    && s.write_all(&data).is_err()
-                {
-                    stdin = None;
-                }
-            }
-            Some(other) => return Err(io::Error::other(format!("expected Stdin, got {other:?}"))),
-            None => break,
-        }
+    // If the host goes away or breaks protocol, the command dies with the
+    // exchange: nothing is left running for a host that will never read it.
+    if let Err(e) = feed_stdin(&mut reader, child.stdin.take()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
     }
-    drop(stdin);
 
-    let stdout_truncated = out.join().expect("pump thread")?;
-    let stderr_truncated = err.join().expect("pump thread")?;
     let status = child.wait()?;
     let code = status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+
+    // A background process the command left behind may still hold its output
+    // pipes open. Wait briefly for the pumps, then report the exit anyway;
+    // a pump still running fails on its next write once the host hangs up.
+    let deadline = Instant::now() + PUMP_GRACE;
+    let (mut stdout_truncated, mut stderr_truncated) = (false, false);
+    for _ in 0..2 {
+        match done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok((Stream::Stdout, Ok(t))) => stdout_truncated = t,
+            Ok((Stream::Stderr, Ok(t))) => stderr_truncated = t,
+            Ok((_, Err(e))) => return Err(e),
+            Err(_) => break,
+        }
+    }
     send(
         &writer,
         &Frame::Exit(ExitStatus {
@@ -153,6 +172,43 @@ fn handle(conn: File) -> io::Result<()> {
             stderr_truncated,
         }),
     )
+}
+
+/// Forward stdin frames to the child until the empty end-of-input frame.
+/// A child that exits early makes writes fail; that is not an error here.
+/// The host closing the connection first, or sending anything else, is.
+fn feed_stdin(reader: &mut File, mut stdin: Option<ChildStdin>) -> io::Result<()> {
+    loop {
+        match read_frame(reader)? {
+            Some(Frame::Stdin(data)) if data.is_empty() => return Ok(()),
+            Some(Frame::Stdin(data)) => {
+                if let Some(s) = stdin.as_mut()
+                    && s.write_all(&data).is_err()
+                {
+                    stdin = None;
+                }
+            }
+            Some(other) => {
+                return Err(io::Error::other(format!(
+                    "expected Stdin, got {}",
+                    other.kind()
+                )));
+            }
+            None => {
+                return Err(io::Error::other(
+                    "host closed the connection before end of input",
+                ));
+            }
+        }
+    }
+}
+
+/// Reap orphaned processes. The agent may be PID 1, so anything a command
+/// left behind is reparented here and must be waited for.
+fn reap_orphans() {
+    // SAFETY: waitpid with WNOHANG on any child; called only between
+    // exchanges, when no `Child` handle of ours is outstanding.
+    while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
 }
 
 fn command(req: &ExecRequest) -> Command {
@@ -172,36 +228,57 @@ fn command(req: &ExecRequest) -> Command {
     cmd
 }
 
+#[derive(Clone, Copy)]
+enum Stream {
+    Stdout,
+    Stderr,
+}
+
+type PumpDone = mpsc::Sender<(Stream, io::Result<bool>)>;
+
 /// Forward a child's output stream as frames until EOF. Stops forwarding at
 /// the cap but keeps reading, so the child never blocks on a full pipe.
-/// Returns whether the cap was hit.
+/// Reports whether the cap was hit.
 fn pump<R: Read + Send + 'static>(
-    mut src: R,
+    src: R,
     writer: Arc<Mutex<File>>,
-    wrap: fn(Vec<u8>) -> Frame,
-) -> thread::JoinHandle<io::Result<bool>> {
+    stream: Stream,
+    done: PumpDone,
+) {
+    let wrap = match stream {
+        Stream::Stdout => Frame::Stdout,
+        Stream::Stderr => Frame::Stderr,
+    };
     thread::spawn(move || {
-        let mut sent = 0usize;
-        let mut truncated = false;
-        let mut buf = vec![0u8; CHUNK];
-        loop {
-            let n = match src.read(&mut buf) {
-                Ok(0) => return Ok(truncated),
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            };
-            let room = DEFAULT_OUTPUT_CAP.saturating_sub(sent);
-            if n > room {
-                truncated = true;
-            }
-            let take = n.min(room);
-            if take > 0 {
-                send(&writer, &wrap(buf[..take].to_vec()))?;
-                sent += take;
-            }
+        let _ = done.send((stream, forward(src, &writer, wrap)));
+    });
+}
+
+fn forward<R: Read>(
+    mut src: R,
+    writer: &Mutex<File>,
+    wrap: fn(Vec<u8>) -> Frame,
+) -> io::Result<bool> {
+    let mut sent = 0usize;
+    let mut truncated = false;
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let n = match src.read(&mut buf) {
+            Ok(0) => return Ok(truncated),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let room = DEFAULT_OUTPUT_CAP.saturating_sub(sent);
+        if n > room {
+            truncated = true;
         }
-    })
+        let take = n.min(room);
+        if take > 0 {
+            send(writer, &wrap(buf[..take].to_vec()))?;
+            sent += take;
+        }
+    }
 }
 
 fn drain_stdin(reader: &mut File) -> io::Result<()> {

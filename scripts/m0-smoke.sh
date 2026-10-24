@@ -26,6 +26,15 @@ run --timeout 2 -- sleep 10 2>/dev/null; check "timeout exit" "124" "$?"
 check "no network"        "no-network" \
   "$(run -- sh -c 'wget -q -T 3 -O- http://1.1.1.1 >/dev/null 2>&1 && echo reachable || echo no-network' 2>/dev/null)"
 check "clean environment" "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" "$(run -- env 2>/dev/null)"
+start=$(date +%s)
+check "background child does not hold the exec open" "hi" "$(run --timeout 20 -- sh -c 'sleep 30 & echo hi' 2>/dev/null)"
+check "  ...and returns promptly" "1" "$([ $(( $(date +%s) - start )) -lt 5 ] && echo 1 || echo 0)"
+"$V" run --root "$R" --timeout 60 -- sleep 60 >/dev/null 2>&1 &
+driver=$!
+sleep 2
+kill -9 "$driver" 2>/dev/null; wait "$driver" 2>/dev/null
+sleep 1
+check "VMM dies when its driver is SIGKILLed" "" "$(pgrep -f 'sandpiper-vmm boot')"
 check "no leftover VMMs"  "" "$(pgrep -f 'sandpiper-vmm boot')"
 
 [ "$fails" -eq 0 ] && echo "all checks passed" || { echo "$fails check(s) failed"; exit 1; }

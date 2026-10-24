@@ -5,8 +5,8 @@ set -euo pipefail
 crate="${1:-sandpiper}"
 blocklist="${HOME}/.config/git/identity-blocklist"
 
-cargo generate-lockfile --quiet
-cargo package -p "$crate" --allow-dirty --no-verify --quiet
+# --locked: package exactly the committed dependency versions.
+cargo package -p "$crate" --locked --allow-dirty --no-verify --quiet
 version=$(cargo pkgid -p "$crate" | sed 's/.*[#@]//')
 archive="target/package/${crate}-${version}.crate"
 
@@ -15,7 +15,7 @@ trap 'rm -rf "$dir" "$patterns"' EXIT
 tar -xzf "$archive" -C "$dir"
 
 # Blank and comment lines in the blocklist would match everything.
-[ -f "$blocklist" ] && grep -vE '^\s*(#|$)' "$blocklist" > "$patterns"
+if [ -f "$blocklist" ]; then grep -vE '^\s*(#|$)' "$blocklist" > "$patterns" || true; fi
 printf '%s\n' "/Users/" "/home/" "$(id -un)" >> "$patterns"
 
 if grep -rniE -f "$patterns" "$dir"; then
