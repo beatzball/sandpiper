@@ -17,6 +17,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sandpiper_proto::{
@@ -232,17 +233,26 @@ fn exchange(
             cwd: None,
         }),
     )?;
-    if o.stdin {
-        let mut buf = vec![0u8; 32 * 1024];
-        loop {
-            let n = io::stdin().read(&mut buf)?;
-            if n == 0 {
-                break;
+    // Feed stdin from its own thread so output is read while input is still
+    // being sent; otherwise a command that echoes a large input fills both
+    // socket buffers and neither side moves. The thread is never joined: the
+    // machine is destroyed when this function's caller returns, which ends
+    // any write still in flight.
+    let mut feeder = conn.try_clone()?;
+    let feed_stdin = o.stdin;
+    thread::spawn(move || -> io::Result<()> {
+        if feed_stdin {
+            let mut buf = vec![0u8; 32 * 1024];
+            loop {
+                let n = io::stdin().read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                write_frame(&mut feeder, &Frame::Stdin(buf[..n].to_vec()))?;
             }
-            write_frame(&mut conn, &Frame::Stdin(buf[..n].to_vec()))?;
         }
-    }
-    write_frame(&mut conn, &Frame::Stdin(Vec::new()))?;
+        write_frame(&mut feeder, &Frame::Stdin(Vec::new()))
+    });
 
     let mut out = io::stdout().lock();
     let mut err = io::stderr().lock();
@@ -319,7 +329,7 @@ fn connect(socket: &Path, machine: &mut Machine, started: Instant) -> io::Result
                 Ok(None) | Err(_) => {}
             }
         }
-        std::thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
