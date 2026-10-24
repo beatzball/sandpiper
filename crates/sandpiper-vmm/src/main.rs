@@ -149,7 +149,22 @@ fn boot(o: &Opts) -> io::Result<std::convert::Infallible> {
         // ends — even SIGKILL — the pipe closes and the machine goes with it.
         thread::spawn(|| {
             let mut sink = [0u8; 64];
-            while matches!(io::stdin().read(&mut sink), Ok(n) if n > 0) {}
+            loop {
+                match io::stdin().read(&mut sink) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    // Tolerate the fd being made non-blocking under us.
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(_) => break,
+                }
+            }
             std::process::exit(EXIT_SANDPIPER.into());
         });
     }
@@ -192,7 +207,7 @@ impl Drop for Scratch {
 struct ConsoleTail(Arc<Mutex<VecDeque<u8>>>);
 
 impl ConsoleTail {
-    fn capture<R: Read + Send + 'static>(&self, mut src: R) {
+    fn capture<R: Read + Send + 'static>(&self, mut src: R) -> thread::JoinHandle<()> {
         let tail = self.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
@@ -202,7 +217,7 @@ impl ConsoleTail {
                 let excess = t.len().saturating_sub(CONSOLE_TAIL);
                 t.drain(..excess);
             }
-        });
+        })
     }
 
     fn dump(&self) {
@@ -223,12 +238,23 @@ impl ConsoleTail {
 
 /// Kills the VMM process when dropped, so no normal exit path leaks a
 /// machine. Abnormal exits are covered by `--die-with-parent`.
-struct Machine(Child);
+///
+/// The child sits behind a lock shared with the watchdog. Every wait and
+/// every kill goes through `Child`, which refuses to signal a process it has
+/// already reaped, so a recycled pid is never hit.
+struct Machine(Arc<Mutex<Child>>);
+
+impl Machine {
+    fn try_wait(&self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.0.lock().expect("child lock").try_wait()
+    }
+}
 
 impl Drop for Machine {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let mut child = self.0.lock().expect("child lock");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -246,7 +272,7 @@ struct WatchState {
 }
 
 impl Watchdog {
-    fn start(pid: u32, deadline: Instant) -> Self {
+    fn start(child: Arc<Mutex<Child>>, deadline: Instant) -> Self {
         let state = Arc::new(Mutex::new(WatchState {
             deadline,
             done: false,
@@ -262,9 +288,7 @@ impl Watchdog {
                 }
                 if Instant::now() >= st.deadline {
                     st.fired = true;
-                    // SAFETY: plain kill(2). `done` is set, under this lock,
-                    // before the child is reaped, so the pid is still ours.
-                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                    let _ = child.lock().expect("child lock").kill();
                     return;
                 }
             }
@@ -280,7 +304,6 @@ impl Watchdog {
         self.state.lock().expect("watchdog lock").fired
     }
 
-    /// Must be called before the child is reaped.
     fn stop(&self) {
         self.state.lock().expect("watchdog lock").done = true;
     }
@@ -318,30 +341,39 @@ fn run(o: &Opts) -> io::Result<ExitCode> {
         .stderr(Stdio::piped())
         .spawn()?;
     let console = ConsoleTail::default();
-    console.capture(child.stdout.take().expect("piped"));
-    console.capture(child.stderr.take().expect("piped"));
-    let watchdog = Watchdog::start(child.id(), started + BOOT_TIMEOUT);
-    let mut machine = Machine(child);
+    let captures = [
+        console.capture(child.stdout.take().expect("piped")),
+        console.capture(child.stderr.take().expect("piped")),
+    ];
+    let machine = Machine(Arc::new(Mutex::new(child)));
+    let watchdog = Watchdog::start(Arc::clone(&machine.0), started + BOOT_TIMEOUT);
 
-    let outcome = exchange(o, &socket, &mut machine, &watchdog, started);
+    let outcome = exchange(o, &socket, &machine, &watchdog, started);
     watchdog.stop();
+    // Destroy the machine, then let the console readers drain to EOF so a
+    // report shows the VMM's last words.
+    drop(machine);
+    drop(lifeline_w);
+    let dump_console = || {
+        for c in captures {
+            let _ = c.join();
+        }
+        console.dump();
+    };
     let outcome = match outcome {
         Ok(outcome) => outcome,
         // A failure caused by the watchdog's kill is a timeout, not an error.
         Err(_) if watchdog.fired() => Outcome::TimedOut,
         Err(e) => {
-            drop(machine);
-            console.dump();
+            dump_console();
             return Err(e);
         }
     };
-    drop(machine);
-    drop(lifeline_w);
 
     match outcome {
         Outcome::TimedOut => {
             eprintln!("sandpiper-vmm: timed out; machine destroyed");
-            console.dump();
+            dump_console();
             Ok(ExitCode::from(EXIT_TIMEOUT))
         }
         Outcome::Exited {
@@ -367,7 +399,7 @@ fn run(o: &Opts) -> io::Result<ExitCode> {
 fn exchange(
     o: &Opts,
     socket: &Path,
-    machine: &mut Machine,
+    machine: &Machine,
     watchdog: &Watchdog,
     started: Instant,
 ) -> io::Result<Outcome> {
@@ -475,7 +507,7 @@ impl<W: Write> CappedSink<W> {
 /// watchdog fired during boot.
 fn connect(
     socket: &Path,
-    machine: &mut Machine,
+    machine: &Machine,
     watchdog: &Watchdog,
 ) -> io::Result<Option<UnixStream>> {
     let retryable = |e: &io::Error| {
@@ -494,7 +526,7 @@ fn connect(
         if watchdog.fired() {
             return Ok(None);
         }
-        if let Some(status) = machine.0.try_wait()? {
+        if let Some(status) = machine.try_wait()? {
             if watchdog.fired() {
                 return Ok(None);
             }

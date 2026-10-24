@@ -62,7 +62,6 @@ dependencies = [
 name = "sandpiper-vmm"
 version = "0.0.0"
 dependencies = [
- "libc",
  "sandpiper-proto",
 ]
 

@@ -20,6 +20,8 @@ run -- /nope 2>/dev/null;          check "missing command" "127" "$?"
 check "stdin"             "3"       "$(printf 'a\nb\nc\n' | run --stdin -- wc -l 2>/dev/null | tr -d ' ')"
 check "big stdin + output (no deadlock)" "1048576" \
   "$(head -c 5000000 /dev/zero | run --stdin --timeout 20 -- cat 2>/dev/null | wc -c | tr -d ' ')"
+check "slow reader gets every byte before Exit" "900000" \
+  "$(run --timeout 20 -- head -c 900000 /dev/zero 2>/dev/null | (sleep 2; wc -c) | tr -d ' ')"
 check "output cap reported" "sandpiper: output was truncated at the per-stream cap" \
   "$(run -- head -c 3000000 /dev/zero 2>&1 >/dev/null)"
 run --timeout 2 -- sleep 10 2>/dev/null; check "timeout exit" "124" "$?"
