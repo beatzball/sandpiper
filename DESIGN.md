@@ -1,6 +1,6 @@
 # sandpiper — design
 
-Status: draft · revised 2026-10-23 after a two-reviewer pass
+Status: draft · revised 2026-10-23 after two review rounds
 
 One platform that runs code on hardware we control. The same core runs two
 kinds of workload:
@@ -50,7 +50,7 @@ Sandbox mode ships first. Service mode is built on the same parts afterwards.
 |---|---|
 | **Host** | A server that can run microVMs: Linux with KVM in production, macOS with Hypervisor.framework for development only. Runs the host agent. |
 | **Pool** | A named group of hosts. `untrusted` and `services` are separate pools on separate hosts, so untrusted code never shares a host with production apps. |
-| **Template** | An immutable root filesystem plus defaults (CPU, memory, policy, start command). Versioned by content hash. Built from an OCI image or Dockerfile from M3; until then, prebuilt and trusted. |
+| **Template** | An immutable root filesystem plus defaults (CPU, memory, policy, start command) for one CPU architecture (`arm64` or `x86_64`). Versioned by content hash; the scheduler only places it on hosts of its architecture. Built from an OCI image or Dockerfile from M3; until then, prebuilt and trusted. |
 | **Snapshot** | A saved disk state, for rollback and branching. Memory snapshots for fast starts arrive with driver 2 (§4.3). |
 | **Machine** | A running microVM from a template. Has an ID, a mode, a policy, a state. |
 | **Mode** | `ephemeral` or `service`. Decides lifetime, restart behaviour, ingress and pool. |
@@ -136,7 +136,9 @@ each host's report.
 
 ### 4.2 Host agent
 
-One binary per host. Talks to the control plane over mutual TLS.
+One binary per host, run as root under systemd, because it creates users,
+namespaces and cgroups. It never runs guest code itself. Talks to the control
+plane over mutual TLS.
 
 - **One VMM process per machine.** libkrun's `krun_start_enter` takes over the
   calling process and does not return, so the host agent spawns a small
@@ -147,15 +149,18 @@ One binary per host. Talks to the control plane over mutual TLS.
   network namespace on Linux, with a seccomp filter, and with only that
   machine's files visible. A VMM escape then lands in an empty, powerless
   process — this is the outer layer of the first wall.
-- **Network:** on Linux, one tap device in its own network namespace per
-  machine, wired only to the egress proxy (§7.3). libkrun's implicit
+- **Network:** on Linux, one tap device (libkrun's `krun_add_net_tap`) in its
+  own network namespace per machine, wired only to the egress proxy (§7.3).
+  A machine with `egress: 'none'` gets no network device at all. libkrun's implicit
   socket-forwarding networking (TSI, which lets the guest open sockets *as the
   host process*) is **disabled** on every production host.
 - **Warm pool:** N booted, idle machines per popular template, one process
   each, ready to hand out. (Driver 1 cannot pause; see §4.3.)
 - Runs the **egress proxy** for its machines (§7.3, §8).
-- Enforces CPU, memory, disk, PID and wall-clock limits from outside the guest
-  (cgroups on Linux).
+- Enforces CPU, memory, disk and wall-clock limits from outside the guest
+  (cgroups on Linux). Host cgroups see only VMM threads, not guest processes,
+  so the policy's `pids` limit is enforced **inside** the guest by the guest
+  agent (§4.4).
 - Ships logs, metrics and audit records to the control plane, spooling when it
   cannot (§4.1).
 
@@ -206,7 +211,10 @@ init before any workload.
 - Output is capped per exec (1 MiB per stream by default); the cap is marked
   in the result when hit.
 - Applies the **in-guest confinement** part of the policy (§7.2) to every
-  process it starts.
+  process it starts, including the `pids` limit through a guest cgroup.
+- Installs the host's proxy CA (§8) and points common runtimes at it on every
+  exec: `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`.
+- Freezes and thaws guest filesystems on request, for snapshots (§10).
 
 ### 4.5 Edge proxy
 
@@ -355,7 +363,8 @@ and simple.** No free-form globs, no regexes.
 
 | Part | Child ⊆ parent when… |
 |---|---|
-| `fs.read` / `fs.write` | every child prefix is equal to or under some parent prefix, and not under a parent `deny` |
+| `fs.read` | every child prefix is equal to or under some parent `read` or `write` prefix, and not under a parent `deny` |
+| `fs.write` | every child prefix is equal to or under some parent **`write`** prefix (never a read-only one), and not under a parent `deny` |
 | `fs.deny` | the child's deny set contains every parent deny prefix (it may add more) |
 | `net.egress` | `none` ⊆ `allowlist` |
 | `net.allow` | every child rule is covered by one parent rule: same or narrower host (`a.x.com` ⊆ `*.x.com`), same port, method set ⊆, path prefix under |
@@ -395,10 +404,17 @@ in **separate machines**. Egress is attributed to the machine, not to the exec.
 - **The proxy resolves names itself** and connects to the address it resolved.
   It refuses private, loopback, link-local and metadata ranges, so DNS
   rebinding and literal-IP requests go nowhere.
-- For TLS it requires SNI to match an allowed rule and, where it intercepts
-  (§8), the HTTP `Host` to match the SNI. It **verifies the upstream
-  certificate** for the name it connected to. No `CONNECT` tunnels to names
-  outside the allow-list.
+- Two TLS modes, chosen per rule:
+  - **Intercepted** — required for any rule with `methods` or `pathPrefix`,
+    and for secret grants. The proxy terminates TLS, requires the HTTP
+    authority to equal the SNI and the rule's host, enforces method and path,
+    and re-originates TLS, **verifying the upstream certificate**. Protocol
+    upgrades and `CONNECT` are refused unless the rule allows them.
+  - **Opaque** — host and port only. The proxy checks SNI and passes bytes
+    through. It cannot see the HTTP authority inside, so on shared front ends
+    (CDNs) a client can reach other sites behind the same address (domain
+    fronting). Opaque rules are allowed only where that is acceptable, and the
+    guarantee is stated as "connections to this SNI", nothing more.
 - DNS from the guest is answered only by the proxy; blocked names get no
   answer. Other UDP, ICMP and IPv6 are dropped (IPv6 may be added later).
 - `egress: 'none'` is enforced by the host firewall, not only by the proxy.
@@ -434,8 +450,11 @@ Code in a machine needs to call paid APIs. It must not receive the key.
    - the request matches the grant's host, method and path prefix;
    - the placeholder is the **entire value of the one configured header**.
    It never rewrites bodies, URLs, query strings or any other header.
-5. A placeholder seen anywhere else — another header, a body, a URL, another
-   host — is **stripped** and logged as a probe.
+5. An intercepted request that carries a placeholder anywhere else — another
+   header, the body, the URL, or a request to a different host — is
+   **rejected** (not forwarded, nothing rewritten) and logged as a probe.
+   Opaque traffic cannot be inspected, so probe detection covers intercepted
+   traffic only.
 6. The proxy **does not follow redirects** on credentialed requests; the
    redirect goes back to the guest without the credential.
 7. The real value lives in the control-plane vault and in proxy memory. It
@@ -466,11 +485,16 @@ inside the guest without crossing one of those interfaces is not recorded.
   first, for every machine, and once more at destroy. A seal signs: machine ID,
   sequence range, chain head hash, the previous seal's hash, and — for the
   final seal — the terminal status.
-- Seals are **copied off the host** as they are made (to the control plane and
-  to an operator-chosen external store), so a truncated tail is detectable
-  against a checkpoint the host cannot rewrite.
-- `GET /v1/machines/:id/audit` returns the records and seals. Anyone with the
-  public key can verify nothing was removed, reordered or edited.
+- Seals are **copied off the host** to the control plane as they are made, and
+  optionally to an operator-chosen external store (none is required, per goal
+  7). A truncated tail is then detectable against a checkpoint the host cannot
+  rewrite.
+- `GET /v1/machines/:id/audit` returns the records and seals. With the public
+  key, a verifier can check that nothing **up to the latest seal it has
+  independently obtained** was removed, reordered or edited. Records after
+  that seal are not yet protected against tail deletion. A **destroyed**
+  machine's log is complete only if it ends in a final seal with a terminal
+  status.
 
 This answers "what did the agent do through the platform?" after the fact,
 with proof.
@@ -480,8 +504,10 @@ with proof.
 ## 10. Snapshots and rollback
 
 - **Before-exec snapshots.** An exec can ask for `snapshot: true`. The host
-  takes a copy-on-write copy of the machine's block image first (APFS clones on
-  macOS, reflinks on XFS/btrfs on Linux).
+  asks the guest agent to `sync` and freeze the writable filesystems, waits
+  for pending disk writes to drain, takes a copy-on-write copy of the block
+  image (reflinks on XFS/btrfs), then thaws. A machine that cannot be frozen
+  is stopped cleanly before the copy instead.
 - **Restore is never live.** Restore = stop the machine → swap in the snapshot
   image → boot. Running processes and open files do not survive a restore.
 - **What rollback cannot undo:** anything that left the machine — network
@@ -491,7 +517,8 @@ with proof.
 - **Memory snapshots (driver 2).** Clones are made only from pristine template
   snapshots, never from a machine that has run user code. Each clone gets new
   identity: machine ID, placeholders, guest-agent session, and fresh entropy
-  (VM generation ID), and re-establishes its vsock connection.
+  (VM generation ID); it re-installs its current host's proxy CA and
+  re-establishes its vsock connection.
 
 Snapshots are bound by the same policy as their machine and are deleted with
 it unless pinned.
@@ -576,7 +603,7 @@ locally).
 | | Scope | Done when |
 |---|---|---|
 | **M0** | **On the Mac.** `sandpiper-vmm` boots an arm64 Linux rootfs with libkrun. The guest agent binds vsock; the host connects, sends one `exec`, gets stdout, stderr and exit code back; the machine is destroyed. Wire format fixed. | `hello` comes back over vsock in < 1 s from process start, repeatably. |
-| **M1** | **On a Linux KVM box.** Host agent + thin control API, one host, one prebuilt **trusted** template on a block image. `create/exec/destroy`, stdin, output caps, TTLs. Sandboxed VMM processes, cgroup limits, TSI off, **`egress: none` enforced by the host firewall**. Event log with replay. TS client. | Litro `run-code` works end to end in the playground; a machine cannot reach the LAN or internet. |
+| **M1** | **On a Linux KVM box.** Host agent + thin control API, one host, one prebuilt **trusted** template on a block image, built for the box's architecture. `create/exec/destroy`, stdin, output caps, TTLs. Sandboxed VMM processes, cgroup limits, TSI off, **`egress: none` enforced by the host firewall**. Event log with replay. TS client. | Litro `run-code` works end to end in the playground; a machine cannot reach the LAN or internet. |
 | **M2** | Policy language and compiler (§7.1), in-guest confinement, egress proxy with allow-list and DNS/IP rules (§7.3). | A suite of escape attempts all fail and all appear in the log. |
 | **M3** | Secrets via placeholders (§8), audit chain + seals + off-host checkpoints (§9), disk snapshots and restore (§10). Template builds from OCI/Dockerfile, run inside untrusted machines. | An agent calls a paid API with a key it never receives; audit verifies offline. |
 | **M4** | Service mode on a separate host: persistent volumes, edge proxy with registered domains, deploy with health-checked swap, restart on crash, promotion. | A Litro app is served on its own domain from this platform. |
