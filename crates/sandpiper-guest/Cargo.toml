@@ -1,0 +1,14 @@
+[package]
+name = "sandpiper-guest"
+version = "0.0.0"
+description = "The sandpiper guest agent: runs inside each microVM and answers the host over vsock."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+sandpiper-proto.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "sandpiper-proto"
+version = "0.0.0"
+description = "Wire protocol between the sandpiper host and guest agents."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

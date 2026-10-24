@@ -1,0 +1,11 @@
+[package]
+name = "sandpiper-vmm"
+version = "0.0.0"
+description = "Boots one sandpiper microVM with libkrun. One process per machine."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+sandpiper-proto.workspace = true
