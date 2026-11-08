@@ -4,7 +4,7 @@
 //! exchange per connection. The host always connects in; this process never
 //! dials out.
 //!
-//! Not yet here (M2): dropping workloads to an unprivileged uid and the
+//! Not yet here (M1): dropping workloads to an unprivileged uid and the
 //! seccomp filter that keeps them off vsock.
 
 #[cfg(target_os = "linux")]
