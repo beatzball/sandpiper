@@ -164,7 +164,9 @@ plane over mutual TLS.
 - Runs the **egress proxy** for its machines (§7.3, §8), as its own
   unprivileged user with a seccomp filter, never as root. The proxy holds
   every real key and CA key for the host, so it has per-machine connection
-  and rate limits, and its parsers are fuzzed.
+  and rate limits, and its parsers are fuzzed. The host agent opens the
+  proxy's listening socket inside each machine's network namespace and passes
+  it to the proxy, so the proxy needs no privilege to enter namespaces.
 - Enforces CPU, memory, disk and wall-clock limits from outside the guest
   (cgroups on Linux). Host cgroups see only VMM threads, not guest processes,
   so the policy's `pids` limit is enforced **inside** the guest by the guest
@@ -236,9 +238,12 @@ before any workload.
   the build, outside the build machine, and that the build's files cannot
   shadow. The template signature covers this layer. Otherwise every in-guest
   wall would be code the attacker wrote.
-- **Fresh entropy at every boot.** The host passes a random seed; the guest
-  agent mixes it into the kernel's pool before any workload, so machines
-  from one template or one disk branch never share random state.
+- **Fresh kernel entropy at every boot.** The host passes a random seed; the
+  guest agent mixes it into the kernel's pool before any workload, so machines
+  from one template or one disk branch never share kernel random state.
+  Random state that programs saved on disk is not covered: templates must not
+  ship persistent identities (SSH host keys, saved RNG seeds); they are made
+  at first boot.
 
 - **The host connects in; the guest never dials out.** At boot the guest agent
   binds its vsock port (one fixed port) before any workload exists, so no other
@@ -270,7 +275,10 @@ before any workload.
 ### 4.5 Edge proxy
 
 Terminates TLS. Built on an off-the-shelf proxy configured by the control
-plane through its admin API. Two kinds of route:
+plane through its admin API. It rejects ambiguous requests (for example,
+conflicting `Content-Length` and `Transfer-Encoding`) and normalises the rest
+before it forwards them, so a request cannot mean one thing to the edge and
+another to the machine behind it. Two kinds of route:
 
 - **Preview URLs** for ephemeral machines, when policy allows exposure.
   - On a **separate registrable domain** used for nothing else (for example
@@ -468,7 +476,9 @@ operator — is listed in `docs/threats.md`.
 - **The proxy connects upstream on IPv4 only** until IPv6 is designed.
 - **An operator deny list** adds addresses that are public but still inside:
   at least the host's and the site's own public addresses, and the control
-  plane's and edge proxy's addresses. On a home network, a request to the
+  plane's and edge proxy's addresses, which the control plane adds itself.
+  Machines therefore cannot reach services served by this platform's own edge
+  proxy. On a home network, a request to the
   site's own public IP can loop back through the router into the LAN (hairpin
   NAT), and the global-address rule cannot see that. A home WAN address
   changes, so the host agent looks up its own public address on a timer and
@@ -484,8 +494,9 @@ operator — is listed in `docs/threats.md`.
     (CDNs) a client can reach other sites behind the same address (domain
     fronting). Opaque rules are allowed only where that is acceptable, and the
     guarantee is stated as "connections to this SNI", nothing more.
-- DNS from the guest is answered only by the proxy; blocked names get no
-  answer. Other UDP, ICMP and IPv6 are dropped (IPv6 may be added later).
+- DNS from the guest is answered only by the proxy. The proxy checks a name
+  against the machine's rules **before** it asks any upstream resolver;
+  blocked names get no answer and are never sent upstream. Other UDP, ICMP and IPv6 are dropped (IPv6 may be added later).
 - `egress: 'none'` means the machine gets no network device (§4.2). The host
   firewall is the second layer, for the case where a device is attached by
   mistake.
@@ -777,7 +788,7 @@ locally).
 |---|---|---|
 | **M0** | **On the Mac.** `sandpiper-vmm` boots an arm64 Linux rootfs with libkrun. The guest agent binds vsock; the host connects, sends one `exec`, gets stdout, stderr and exit code back; the machine is destroyed. Wire format fixed. | `hello` comes back over vsock in < 1 s from process start, repeatably. |
 | **M1** | **On a Linux KVM box.** Host agent + thin control API, one host, one prebuilt **trusted** template on a block image, built for the box's architecture. `create/exec/destroy`, stdin, output caps, TTLs. Sandboxed VMM processes, cgroup limits, TSI off, **`egress: none`: no network device, host firewall as second layer** (§7.3), workloads as an unprivileged uid with `AF_VSOCK` refused, wall checks with canaries (§4.2). Fuzzed guest frame decoder in the VMM process, fresh entropy seed per boot, hardened host (§12). Event log with replay. TS client. | Litro `run-code` works end to end in the playground; a machine cannot reach the LAN or internet; a VMM started with TSI on, or with a network device on an `egress: none` machine, is marked `failed` by the wall check. |
-| **M2** | Policy language and compiler (§7.1), in-guest confinement, egress proxy with allow-list, DNS/IP rules and a CA per machine for intercepted rules, starter presets and blocked-hosts view (§7.3, §8). Wall check adds proxy probes: a denied name gets no answer, a literal IP and each refused range are refused, a direct connection that skips the proxy is dropped. Fuzzed proxy parsers. Work out as git objects (§11.3). Signed host releases (§12). | A suite of escape attempts, one per M1 and M2 row of `docs/threats.md`, all fail and all appear in the log. |
+| **M2** | Policy language and compiler (§7.1), in-guest confinement, egress proxy with allow-list, DNS/IP rules and a CA per machine for intercepted rules, starter presets and blocked-hosts view (§7.3, §8). Wall check adds proxy probes: a denied name gets no answer, a literal IP and each refused range are refused, a direct connection that skips the proxy is dropped. Fuzzed proxy parsers. Work out as git objects (§11.3). Signed host releases (§12). | A test per M1 and M2 row of `docs/threats.md` shows its stated result: **Blocked** and **Kept inside** attacks fail, **Narrowed** attacks stay within their stated limit, and every attempt appears in the log. |
 | **M3** | Secrets via placeholders and the credential-call deny list (§8), audit chain + seals + off-host checkpoints (§9), disk snapshots and restore (§10). Template builds from OCI/Dockerfile, run inside untrusted machines; signed templates (§12). | An agent calls a paid API with a key it never receives; audit verifies offline. |
 | **M4** | Service mode on a separate host: persistent volumes, edge proxy with registered domains, deploy with health-checked swap, restart on crash, promotion. | A Litro app is served on its own domain from this platform. |
 | **M5** | Driver 2, memory snapshots, branching, preview URLs, PTY, files API, multi-host scheduling. | Start from snapshot < 300 ms; two hosts share load. |
