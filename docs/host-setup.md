@@ -14,7 +14,46 @@ brew install slp/krun/libkrun
 ```
 
 A Mac host is for development only and must never run untrusted code — see
-DESIGN.md §12. The rest of this guide is for Linux hosts.
+DESIGN.md §12.
+
+## 0.1 A Linux KVM dev VM on the Mac (M1 development only)
+
+An M3 or newer Mac on macOS 15 or later can give a Linux VM its own `/dev/kvm`
+(nested virtualization). That is enough to build and test M1 without a spare
+machine. It is slower than real hardware and it is **not** an isolation
+boundary: the whole stack runs inside your Mac. Use a real Linux host
+(sections 1–7) before any isolation testing.
+
+```sh
+brew install lima
+limactl create --name=sandpiper-dev --tty=false --vm-type=vz \
+  --cpus=4 --memory=8 --disk=40 \
+  --set '.nestedVirtualization=true | .mounts=[{"location":"'"$PWD"'","writable":false}]' \
+  template:ubuntu-24.04
+limactl start sandpiper-dev
+```
+
+Run this from the repository root. It mounts only the repository, read-only.
+Build inside the VM with a target directory of its own.
+
+Check KVM inside the VM:
+
+```sh
+limactl shell sandpiper-dev bash -lc 'uname -m && ls -l /dev/kvm'
+```
+
+Expect `aarch64` and a `/dev/kvm` character device. Then install the build
+tools in the VM:
+
+```sh
+limactl shell sandpiper-dev bash -lc '
+  sudo apt-get update && sudo apt-get install -y build-essential pkg-config git curl nftables
+  curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal'
+```
+
+Stop it with `limactl stop sandpiper-dev` when you are not using it.
+
+The rest of this guide is for real Linux hosts.
 
 ## 1. Check the hardware
 
