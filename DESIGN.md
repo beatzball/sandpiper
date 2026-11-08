@@ -173,7 +173,8 @@ plane over mutual TLS.
     runs until the checks pass.
   - **Inside probes, as the workload uid:** a direct connection to each of a
     set of **canary listeners** the host agent runs (outside the machine's
-    namespace, on the host, on a LAN-facing address), and a
+    namespace, on the host, on a LAN-facing address, and one inside the VMM
+    process's own network namespace, which catches TSI), and a
     `socket(AF_VSOCK, …)` call, which must be refused. A probe fails if any
     connection **reaches a canary**, judged on the host side, never from what
     the guest reports. Blocked paths use reject rules, so probes return at
@@ -185,8 +186,10 @@ plane over mutual TLS.
     caller's policy is known. The policy-specific outside checks run again
     when it is handed out.
   - **On a timer.** The host agent re-checks its nftables table hash. If
-    another program changed or flushed it, the host stops starting machines
-    and raises an alert.
+    another program changed or flushed it, the host stops starting machines,
+    takes down the network links of running machines, and raises an alert.
+  - **Upgrades drain the host.** Proxy CA keys live only in memory (§8), so
+    the host agent is upgraded only after its machines are moved or stopped.
 
 ### 4.3 Runtime driver
 
@@ -311,6 +314,9 @@ POST   /v1/machines                  { template, policy?, ttl?, metadata? }
 GET    /v1/machines/:id
 DELETE /v1/machines/:id
 POST   /v1/machines/:id/exec         { cmd, cwd?, env?, stdin?, policy? } → stream
+# M2
+POST   /v1/machines/:id/exec         { …, binary: { maxBytes } } → byte stream, complete: bool
+POST   /v1/machines/:id/fetch        { ref } → { scratchRef }   (§11.3)
 GET    /v1/events?machine=&from=     replayable event stream
 
 # M2–M3
@@ -508,8 +514,9 @@ Code in a machine needs to call paid APIs. It must not receive the key.
    and grant, and worthless anywhere else.
 3. HTTPS to granted hosts is intercepted by the egress proxy. The guest trusts
    the proxy's CA: **one CA per machine**, made by the proxy when the machine
-   boots (warm machines included), whose public certificate the guest agent
-   installs before any workload. The key is ECDSA P-256, so making one costs
+   is handed out and its policy is resolved (for a warm machine, at hand-out,
+   not at boot), whose public certificate the guest agent installs before any
+   workload. The key is ECDSA P-256, so making one costs
    well under a millisecond. Each CA carries X.509 name constraints, so it can
    sign only the hosts that machine's rules intercept. A key that leaks alone
    (a crash dump, a log) then reaches one machine only; a compromised proxy
@@ -542,9 +549,12 @@ Code in a machine needs to call paid APIs. It must not receive the key.
 9. **Credential-making calls.** Some calls turn one credential into another
    that works without the proxy: adding an SSH key, deploy key, CI runner or
    webhook on a code host, or minting a short-lived token on a model API.
-   - **The main defence is the credential's own scope.** Grants should hold
-     upstream credentials that cannot make credentials (fine-grained tokens
-     without key or hook administration).
+   - **The main defence is the credential's own scope.** Creating a grant
+     requires the operator to state that its credential cannot make
+     credentials (a fine-grained token without key or hook administration).
+     The platform cannot check that statement; if it is wrong, the guest can
+     mint a credential through any operation the deny list misses and use it
+     outside the proxy.
    - **A reviewed deny list is the second layer.** It is internal, not part of
      the policy language, so its patterns may use segment wildcards
      (`/repos/*/*/keys`). A grant whose host, method and path cover a listed
@@ -552,7 +562,7 @@ Code in a machine needs to call paid APIs. It must not receive the key.
      inject a credential into a request to a listed endpoint.
    - **Single-endpoint APIs** (GraphQL, batch) carry every operation through
      one path, so a path list cannot see them. A grant that covers one is
-     rejected unless the proxy validates the request body for that API.
+     rejected. (Checking request bodies per API is on the §14.1 list.)
    - The list is best effort and is reviewed as providers add endpoints.
 
 **Trust limit, stated plainly:** once the real key reaches the upstream, the
@@ -676,8 +686,9 @@ the host side is built to parse it safely.
 - Fetched work is then checked out or merged inside a machine, never in an
   operator's working checkout. Nothing on the host changes until a person or a
   trusted step merges it.
-- The client wraps this as `m.fetch(ref)`, so a Litro tool can hand a result
-  branch to a review step.
+- The client wraps this as `m.fetch(ref)`. It returns the name of the fetched
+  ref in the host's scratch repository, so a Litro tool can hand that branch to
+  a review step.
 
 ### 11.4 From sandbox to service (M4+)
 
@@ -731,7 +742,7 @@ locally).
 | | Scope | Done when |
 |---|---|---|
 | **M0** | **On the Mac.** `sandpiper-vmm` boots an arm64 Linux rootfs with libkrun. The guest agent binds vsock; the host connects, sends one `exec`, gets stdout, stderr and exit code back; the machine is destroyed. Wire format fixed. | `hello` comes back over vsock in < 1 s from process start, repeatably. |
-| **M1** | **On a Linux KVM box.** Host agent + thin control API, one host, one prebuilt **trusted** template on a block image, built for the box's architecture. `create/exec/destroy`, stdin, output caps, TTLs. Sandboxed VMM processes, cgroup limits, TSI off, **`egress: none` enforced by the host firewall**, workloads as an unprivileged uid with `AF_VSOCK` refused, wall checks with canaries (§4.2). Fuzzed guest frame decoder. Event log with replay. TS client. | Litro `run-code` works end to end in the playground; a machine cannot reach the LAN or internet; a VMM started with TSI on, or with a network device on an `egress: none` machine, is marked `failed` by the wall check. |
+| **M1** | **On a Linux KVM box.** Host agent + thin control API, one host, one prebuilt **trusted** template on a block image, built for the box's architecture. `create/exec/destroy`, stdin, output caps, TTLs. Sandboxed VMM processes, cgroup limits, TSI off, **`egress: none`: no network device, host firewall as second layer** (§7.3), workloads as an unprivileged uid with `AF_VSOCK` refused, wall checks with canaries (§4.2). Fuzzed guest frame decoder. Event log with replay. TS client. | Litro `run-code` works end to end in the playground; a machine cannot reach the LAN or internet; a VMM started with TSI on, or with a network device on an `egress: none` machine, is marked `failed` by the wall check. |
 | **M2** | Policy language and compiler (§7.1), in-guest confinement, egress proxy with allow-list, DNS/IP rules and a CA per machine for intercepted rules, starter presets and blocked-hosts view (§7.3, §8). Wall check adds proxy probes: a denied name gets no answer, a literal IP and each refused range are refused, a direct connection that skips the proxy is dropped. Fuzzed proxy parsers. Work out as git objects (§11.3). Signed host releases (§12). | A suite of escape attempts all fail and all appear in the log. |
 | **M3** | Secrets via placeholders and the credential-call deny list (§8), audit chain + seals + off-host checkpoints (§9), disk snapshots and restore (§10). Template builds from OCI/Dockerfile, run inside untrusted machines; signed templates (§12). | An agent calls a paid API with a key it never receives; audit verifies offline. |
 | **M4** | Service mode on a separate host: persistent volumes, edge proxy with registered domains, deploy with health-checked swap, restart on crash, promotion. | A Litro app is served on its own domain from this platform. |
@@ -780,6 +791,8 @@ locally).
   settings into a machine with secrets replaced by placeholders, and let
   changes back out only after a shown diff (hidden characters shown as codes)
   that a person approves.
+- **Request-body checks per API**, so a grant could cover a single-endpoint
+  API (GraphQL, batch) and allow only named operations (§8).
 - **Script-style CLI tests.** Small text files that hold a command, its input
   and the expected output, for the host agent's CLI. (Fuzzing of parsers that
   read guest input is not "later": it ships with each parser, see §13.)
