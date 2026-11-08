@@ -20,8 +20,9 @@ development host makes no claim and must never run untrusted code.
 **When a claim starts.** Most walls are designed, not built. The `From`
 column says which milestone makes the claim true. Until then, the claim does
 not hold. The M2 escape suite has a test for every row marked M1 or M2:
-**Blocked** and **Kept inside** attacks must fail, **Narrowed** attacks must
-stay within their stated limit, and **Left to you** rows get no test. Later
+**Blocked** attacks must fail, **Kept inside** attacks must affect nothing
+outside their machine, **Narrowed** attacks must stay within their stated
+limit, and **Left to you** rows get no test. Later
 rows get tests in their own milestone.
 
 **"Blocked" means against the stated attack, with the walls working.** No
