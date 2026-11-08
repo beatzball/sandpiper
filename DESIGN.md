@@ -164,16 +164,29 @@ plane over mutual TLS.
   agent (§4.4).
 - Ships logs, metrics and audit records to the control plane, spooling when it
   cannot (§4.1).
-- **Checks the walls of every machine after it starts, and fails closed.**
-  Before a machine is handed out (or put in the warm pool), the host agent
-  runs a fixed set of probes. From inside, as the workload uid: a direct
-  connection to an outside address, to the host, to the LAN and to cloud
-  metadata, and a `socket(AF_VSOCK, …)` call. From outside: the machine's
-  namespace, tap, firewall rules and cgroup are the ones its policy asks for.
-  If any probe gets through or any check differs, the machine is stopped,
-  marked `failed`, and the reason is recorded. The probes run on every start,
-  not only in a test suite, so a broken host fails loudly instead of quietly
-  running open machines.
+- **Checks the walls of every machine, and fails closed** (Linux production
+  hosts; the Mac makes no claim, §12). A failed check stops the machine, marks
+  it `failed` and records why. A broken host then fails loudly instead of
+  quietly running open machines.
+  - **Before any workload.** The guest agent runs the inside probes before it
+    starts the template's start command or any exec. Nothing from the template
+    runs until the checks pass.
+  - **Inside probes, as the workload uid:** a direct connection to each of a
+    set of **canary listeners** the host agent runs (outside the machine's
+    namespace, on the host, on a LAN-facing address), and a
+    `socket(AF_VSOCK, …)` call, which must be refused. A probe fails if any
+    connection **reaches a canary**, judged on the host side, never from what
+    the guest reports. Blocked paths use reject rules, so probes return at
+    once and do not cost boot time.
+  - **Outside checks:** the machine's namespace, tap (if any), cgroup and
+    TSI setting are the ones its policy asks for. sandpiper keeps its
+    firewall rules in its own nftables table and compares a hash of it.
+  - **Again at hand-out.** A warm machine is checked at boot, before its
+    caller's policy is known. The policy-specific outside checks run again
+    when it is handed out.
+  - **On a timer.** The host agent re-checks its nftables table hash. If
+    another program changed or flushed it, the host stops starting machines
+    and raises an alert.
 
 ### 4.3 Runtime driver
 
@@ -212,6 +225,8 @@ init before any workload.
 - **Workloads cannot reach vsock.** Every workload process runs as an
   unprivileged uid with no capabilities and a seccomp filter that refuses
   `socket(AF_VSOCK, …)`. Root inside the guest is reserved for the guest agent.
+  The uid drop and this one seccomp rule come in M1; the configurable
+  confinement of §7.2 comes in M2.
 - **Guest messages are untrusted input.** The protocol is length-prefixed
   frames with a hard size cap (1 MiB per frame), parsed by a bounded decoder.
   The host agent exposes no management operation over this channel — the guest
@@ -220,7 +235,9 @@ init before any workload.
   return exit code), `ports` (report listening ports for preview). `pty` and a
   `files` API arrive later; until then files move through `exec` with stdin.
 - Output is capped per exec (1 MiB per stream by default); the cap is marked
-  in the result when hit.
+  in the result when hit. A **binary stream mode** with an explicit size limit
+  set by the host carries file and git transfers (§11.3); a transfer that hits
+  its limit or ends early is reported as incomplete, never as success.
 - Applies the **in-guest confinement** part of the policy (§7.2) to every
   process it starts, including the `pids` limit through a guest cgroup.
 - Installs the machine's proxy CA (§8) and points common runtimes at it on every
@@ -413,10 +430,17 @@ in **separate machines**. Egress is attributed to the machine, not to the exec.
   machine's tap interface, so one proxy per host serves all machines safely.
   No route to other machines, the host, the LAN or cloud metadata.
 - **The proxy resolves names itself** and connects to the address it resolved.
-  It refuses private, loopback, link-local, carrier-grade NAT
-  (`100.64.0.0/10`) and metadata ranges, and the same ranges written inside
-  IPv6 forms (IPv4-mapped `::ffff:0:0/96`, NAT64 `64:ff9b::/96`). DNS
-  rebinding and literal-IP requests go nowhere.
+  It connects only to addresses that are **globally reachable** according to
+  the IANA special-purpose address registries. This is an allow rule, not a
+  list of refused ranges, so private, loopback, link-local, carrier-grade NAT,
+  benchmark, reserved and metadata addresses are all refused, including when
+  written inside IPv6 forms (IPv4-mapped, NAT64, 6to4, Teredo). DNS rebinding
+  and literal-IP requests go nowhere.
+- **The proxy connects upstream on IPv4 only** until IPv6 is designed.
+- **An operator deny list** adds addresses that are public but still inside:
+  at least the host's and the site's own public addresses. On a home network,
+  a request to the site's own public IP can loop back through the router into
+  the LAN (hairpin NAT), and the global-address rule cannot see that.
 - Two TLS modes, chosen per rule:
   - **Intercepted** — required for any rule with `methods` or `pathPrefix`,
     and for secret grants. The proxy terminates TLS, requires the HTTP
@@ -430,22 +454,36 @@ in **separate machines**. Egress is attributed to the machine, not to the exec.
     guarantee is stated as "connections to this SNI", nothing more.
 - DNS from the guest is answered only by the proxy; blocked names get no
   answer. Other UDP, ICMP and IPv6 are dropped (IPv6 may be added later).
-- `egress: 'none'` is enforced by the host firewall, not only by the proxy.
+- `egress: 'none'` means the machine gets no network device (§4.2). The host
+  firewall is the second layer, for the case where a device is attached by
+  mistake.
 - Every allowed and denied connection is an audit record.
-- **Starter allowlist.** The platform ships a reviewed default list for common
-  work: package registries, source hosts, model APIs. It leaves out file
-  storage, paste and file-sharing sites on purpose, because those are the
-  easy way to carry data out.
-- **Blocked-hosts view.** `sandpiper net blocked <machine>` lists each denied
-  host from the audit records, with a count and the narrowest rule that would
-  allow it. This makes tuning an allowlist quick, without guessing.
+- **Starter presets.** The platform ships reviewed, named presets for common
+  work: package registries, source hosts, model APIs. A machine must name a
+  preset to use it; no pool turns one on by default, and the parent policy
+  still limits it. Presets use intercepted rules only (no opaque CDN
+  wildcards, so no domain fronting) and allow read methods and paths where
+  the service allows it (for example, git clone over HTTPS needs
+  `POST …/git-upload-pack`; `git-receive-pack` stays blocked). File storage
+  and paste sites are not in any preset.
+- **Blocked-hosts view.** `sandpiper net blocked <machine>` lists the denied
+  requests from the audit records, grouped, with a count, the reason and the
+  policy layer that denied each one. Where only the host was missing, it also
+  shows the rule that would allow it, or "not allowed by the pool" if that
+  rule would widen a parent. Host names come from the guest, so control
+  characters are escaped before printing.
 - **Limits, stated plainly:**
   - **Domain fronting** on opaque rules (above).
+  - **Any allowed host that stores what it is sent is a way out.** Source
+    hosts, registries and model APIs all accept data. An allowlist limits
+    where data can go, not whether it can leave.
   - **Services that fetch for you.** An allowed API that fetches URLs on the
     caller's behalf (model APIs with web fetch or search tools, link
-    previewers, webhook testers) can carry data to hosts that are not on the
-    list. Allowing such an API means trusting what it fetches. Where the API
-    lets the caller turn those tools off, grants should do so.
+    previewers) can carry data to hosts that are not on the list. The guest
+    writes the request body and the proxy does not change it, so the platform
+    cannot turn these tools off per request. Only a provider-side setting on
+    the key or account helps; grants for such APIs should use a key with those
+    tools turned off where the provider offers one.
 
 ---
 
@@ -470,14 +508,21 @@ Code in a machine needs to call paid APIs. It must not receive the key.
    and grant, and worthless anywhere else.
 3. HTTPS to granted hosts is intercepted by the egress proxy. The guest trusts
    the proxy's CA: **one CA per machine**, made by the proxy when the machine
-   is created, whose public certificate the guest agent installs at boot. A
-   stolen CA key can then reach one machine only. The CA's private key lives
-   only in the proxy's memory — never in a template, a guest or a snapshot.
-   Clients that pin certificates fail closed.
-   - **Rotation.** A CA lives no longer than its machine's `maxMs`, so an
-     ephemeral machine never rotates. A service's CA lasts 30 days. The next
-     CA is made and installed beside the old one 7 days before the old one
-     expires, so a running client never sees an unknown certificate.
+   boots (warm machines included), whose public certificate the guest agent
+   installs before any workload. The key is ECDSA P-256, so making one costs
+   well under a millisecond. Each CA carries X.509 name constraints, so it can
+   sign only the hosts that machine's rules intercept. A key that leaks alone
+   (a crash dump, a log) then reaches one machine only; a compromised proxy
+   still reaches every machine on its host. The CA's private key lives only in
+   the proxy's memory — never in a template, a guest or a snapshot. Clients
+   that pin certificates fail closed.
+   - **Lifetime.** A CA lives as long as its machine. There is no in-place
+     rotation: many runtimes read their CA file only at start, so a new CA
+     under a running process breaks it. A service gets a new CA by a
+     health-checked redeploy, which makes a new machine (§6).
+   - **Proxy restart.** The keys are lost with the proxy's memory. Intercepted
+     traffic from existing machines then fails closed. Ephemeral machines are
+     replaced by their caller; services are redeployed automatically.
 4. The proxy replaces the placeholder **only** when all of these hold:
    - the request matches the grant's host, method and path prefix;
    - the placeholder is the **entire value of the one configured header**.
@@ -494,12 +539,21 @@ Code in a machine needs to call paid APIs. It must not receive the key.
 8. **Revocation:** the control plane pushes revocations to proxies
    immediately; proxies also drop cached secrets after 60 seconds, so a missed
    push still expires within a minute.
-9. **No credential-making calls.** Some endpoints turn one credential into
-   another that works without the proxy: adding an SSH key, deploy key, CI
-   runner or webhook on a code host, or minting a short-lived token on a model
-   API. The platform keeps a reviewed deny list of these endpoints. A grant
-   whose host, method and path cover one is rejected when it is created, and
-   the proxy refuses such a request at run time even if a grant allows it.
+9. **Credential-making calls.** Some calls turn one credential into another
+   that works without the proxy: adding an SSH key, deploy key, CI runner or
+   webhook on a code host, or minting a short-lived token on a model API.
+   - **The main defence is the credential's own scope.** Grants should hold
+     upstream credentials that cannot make credentials (fine-grained tokens
+     without key or hook administration).
+   - **A reviewed deny list is the second layer.** It is internal, not part of
+     the policy language, so its patterns may use segment wildcards
+     (`/repos/*/*/keys`). A grant whose host, method and path cover a listed
+     endpoint is rejected when it is created. At run time the proxy refuses to
+     inject a credential into a request to a listed endpoint.
+   - **Single-endpoint APIs** (GraphQL, batch) carry every operation through
+     one path, so a path list cannot see them. A grant that covers one is
+     rejected unless the proxy validates the request body for that API.
+   - The list is best effort and is reviewed as providers add endpoints.
 
 **Trust limit, stated plainly:** once the real key reaches the upstream, the
 upstream decides what happens to it. An endpoint that echoes request headers
@@ -607,18 +661,23 @@ levels use different machines (§7.2).
 
 ### 11.3 Getting work out
 
-A machine mounts no host folder, so work comes out by **`git fetch`**, not
-through a shared directory.
+A machine mounts no host folder, so work comes out as **git objects**, not
+through a shared directory. A hostile machine controls every byte it sends, so
+the host side is built to parse it safely.
 
-- The machine keeps its own repository. The host runs `git upload-pack` in the
-  machine through `exec`, so the transport is the exec stream and nothing on
-  the host is exposed to the guest.
-- Only refs and objects cross. The host-side git runs with the machine's
-  hooks, filters, `fsmonitor` and config ignored, and with
-  `transfer.fsckObjects` on. Fetched work lands as a branch. Nothing in a
-  host checkout changes until a person or a trusted step merges it.
-- The client wraps this as `m.fetch(ref) → bundle`, so a Litro tool can hand a
-  result branch to a review step.
+- The guest runs `git bundle create` for the requested ref. The host pulls the
+  bundle through the binary stream mode of `exec` (§4.4), with an explicit
+  size limit. A transfer that is cut short is rejected.
+- The host verifies the bundle and fetches it in a **jailed process**: an
+  unprivileged user, no network, no host secrets, CPU, memory, time and size
+  caps, into a fresh bare scratch repository with no shared object store. It
+  uses one explicit refspec into `refs/sandpiper/<machine>/<ref>`, with
+  `fetch.fsckObjects` and `transfer.fsckObjects` on.
+- Fetched work is then checked out or merged inside a machine, never in an
+  operator's working checkout. Nothing on the host changes until a person or a
+  trusted step merges it.
+- The client wraps this as `m.fetch(ref)`, so a Litro tool can hand a result
+  branch to a review step.
 
 ### 11.4 From sandbox to service (M4+)
 
@@ -649,11 +708,21 @@ macOS binaries that use Hypervisor.framework must be code-signed with the
 `com.apple.security.hypervisor` entitlement (an ad-hoc signature is enough
 locally).
 
-**Signed releases.** Host binaries and templates are signed with a minisign
-key. The public key is printed in the repository (README and `SECURITY.md`),
-not only in the release, because a signature that ships beside the files it
-signs proves nothing if the whole release is replaced. The host agent checks a
-template's signature as well as its content hash before it boots it.
+**Signed releases and templates.** Two keys, for two jobs:
+
+- **Release key** (offline, minisign) signs host binaries. Its public key is
+  pinned on each host at install time (a step `docs/host-setup.md` gains with
+  the first release), from a source
+  checked independently of the release, because a key that ships beside the
+  files it signs proves nothing if the whole release is replaced. Binaries are
+  verified before they are installed.
+- **Template key** (online, on the control plane) signs templates the platform
+  builds or approves. Its public key is pinned on each host at enrolment. The
+  host agent checks a template's signature and content hash before it boots
+  it. The signature means "this control plane approved these bytes", so a
+  changed registry store or host disk cannot swap a template. It does not mean
+  the template's software is safe: from M3 it is built in an untrusted
+  machine.
 
 ---
 
@@ -662,9 +731,9 @@ template's signature as well as its content hash before it boots it.
 | | Scope | Done when |
 |---|---|---|
 | **M0** | **On the Mac.** `sandpiper-vmm` boots an arm64 Linux rootfs with libkrun. The guest agent binds vsock; the host connects, sends one `exec`, gets stdout, stderr and exit code back; the machine is destroyed. Wire format fixed. | `hello` comes back over vsock in < 1 s from process start, repeatably. |
-| **M1** | **On a Linux KVM box.** Host agent + thin control API, one host, one prebuilt **trusted** template on a block image, built for the box's architecture. `create/exec/destroy`, stdin, output caps, TTLs. Sandboxed VMM processes, cgroup limits, TSI off, **`egress: none` enforced by the host firewall**, wall check at every start (§4.2). Event log with replay. TS client. | Litro `run-code` works end to end in the playground; a machine cannot reach the LAN or internet; a host with its firewall rule removed refuses to start machines. |
-| **M2** | Policy language and compiler (§7.1), in-guest confinement, egress proxy with allow-list and DNS/IP rules, starter allowlist and blocked-hosts view (§7.3). Wall check extended to the proxy. | A suite of escape attempts all fail and all appear in the log. |
-| **M3** | Secrets via placeholders with a CA per machine and the credential-call deny list (§8), audit chain + seals + off-host checkpoints (§9), disk snapshots and restore (§10), work out by `git fetch` (§11.3). Template builds from OCI/Dockerfile, run inside untrusted machines; signed templates and releases (§12). | An agent calls a paid API with a key it never receives; audit verifies offline. |
+| **M1** | **On a Linux KVM box.** Host agent + thin control API, one host, one prebuilt **trusted** template on a block image, built for the box's architecture. `create/exec/destroy`, stdin, output caps, TTLs. Sandboxed VMM processes, cgroup limits, TSI off, **`egress: none` enforced by the host firewall**, workloads as an unprivileged uid with `AF_VSOCK` refused, wall checks with canaries (§4.2). Fuzzed guest frame decoder. Event log with replay. TS client. | Litro `run-code` works end to end in the playground; a machine cannot reach the LAN or internet; a VMM started with TSI on, or with a network device on an `egress: none` machine, is marked `failed` by the wall check. |
+| **M2** | Policy language and compiler (§7.1), in-guest confinement, egress proxy with allow-list, DNS/IP rules and a CA per machine for intercepted rules, starter presets and blocked-hosts view (§7.3, §8). Wall check adds proxy probes: a denied name gets no answer, a literal IP and each refused range are refused, a direct connection that skips the proxy is dropped. Fuzzed proxy parsers. Work out as git objects (§11.3). Signed host releases (§12). | A suite of escape attempts all fail and all appear in the log. |
+| **M3** | Secrets via placeholders and the credential-call deny list (§8), audit chain + seals + off-host checkpoints (§9), disk snapshots and restore (§10). Template builds from OCI/Dockerfile, run inside untrusted machines; signed templates (§12). | An agent calls a paid API with a key it never receives; audit verifies offline. |
 | **M4** | Service mode on a separate host: persistent volumes, edge proxy with registered domains, deploy with health-checked swap, restart on crash, promotion. | A Litro app is served on its own domain from this platform. |
 | **M5** | Driver 2, memory snapshots, branching, preview URLs, PTY, files API, multi-host scheduling. | Start from snapshot < 300 ms; two hosts share load. |
 
@@ -699,19 +768,21 @@ template's signature as well as its content hash before it boots it.
 
 ### 14.1 Later: considered, not planned
 
-- **Subscription logins.** Let an agent in a machine use the operator's
-  subscription login, not only an API key: the proxy catches the token on its
-  way to the provider's token endpoint, keeps it and refreshes it on the host,
-  and the guest gets a placeholder with no refresh token. Risk: this follows
-  login requests the providers do not document, so any client release can
-  break it, and the provider's terms may not allow it.
+- **Subscription logins, only with a host-owned login flow.** Let an agent in
+  a machine use the operator's subscription login, not only an API key. The
+  simple form, where the guest runs the login and the proxy catches the token
+  on its way out, is **rejected**: the login response would hand tokens to the
+  guest, against §8. A later version would need the host to run the login and
+  the refresh itself, so the guest only ever sees placeholders. Risk either
+  way: these login requests are not documented by the providers, any client
+  release can break them, and the providers' terms may not allow it.
 - **Agent config in, changes out after a diff.** Copy the operator's agent
   settings into a machine with secrets replaced by placeholders, and let
   changes back out only after a shown diff (hidden characters shown as codes)
   that a person approves.
 - **Script-style CLI tests.** Small text files that hold a command, its input
-  and the expected output, plus fuzz and end-to-end CI, for the host agent's
-  CLI.
+  and the expected output, for the host agent's CLI. (Fuzzing of parsers that
+  read guest input is not "later": it ships with each parser, see §13.)
 - **A shared signed package cache.** Only the host fills it, with signed
   packages, to make warm templates cheaper. State the leak: cache timing tells
   one machine what another machine fetched, so it is not for pools whose
