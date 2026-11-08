@@ -150,6 +150,10 @@ plane over mutual TLS.
   network namespace on Linux, with a seccomp filter, and with only that
   machine's files visible. A VMM escape then lands in an empty, powerless
   process — this is the outer layer of the first wall.
+- **Guest frames are decoded in the VMM process, not in the host agent.** The
+  VMM process (unprivileged, sandboxed) parses the guest's frames and passes
+  only checked, typed messages to the root host agent. A decoder bug then
+  lands in the sandboxed process, not in root.
 - **Network:** on Linux, one tap device (libkrun's `krun_add_net_tap`) in its
   own network namespace per machine, wired only to the egress proxy (§7.3).
   A machine with `egress: 'none'` gets no network device at all. libkrun's implicit
@@ -157,13 +161,19 @@ plane over mutual TLS.
   host process*) is **disabled** on every production host.
 - **Warm pool:** N booted, idle machines per popular template, one process
   each, ready to hand out. (Driver 1 cannot pause; see §4.3.)
-- Runs the **egress proxy** for its machines (§7.3, §8).
+- Runs the **egress proxy** for its machines (§7.3, §8), as its own
+  unprivileged user with a seccomp filter, never as root. The proxy holds
+  every real key and CA key for the host, so it has per-machine connection
+  and rate limits, and its parsers are fuzzed.
 - Enforces CPU, memory, disk and wall-clock limits from outside the guest
   (cgroups on Linux). Host cgroups see only VMM threads, not guest processes,
   so the policy's `pids` limit is enforced **inside** the guest by the guest
   agent (§4.4).
 - Ships logs, metrics and audit records to the control plane, spooling when it
-  cannot (§4.1).
+  cannot (§4.1). Audit records that a guest can cause (denied requests,
+  probes) are rate-limited per machine, and each machine has a spool quota. A
+  machine that hits either limit is stopped as a policy violation (§5).
+- Limits disk I/O per machine (cgroup `io.max`) as well as CPU and memory.
 - **Checks the walls of every machine, and fails closed** (Linux production
   hosts; the Mac makes no claim, §12). A failed check stops the machine, marks
   it `failed` and records why. A broken host then fails loudly instead of
@@ -217,8 +227,18 @@ isolation is not an accepted driver for the `untrusted` pool.
 
 ### 4.4 Guest agent
 
-A small static Rust binary baked into every template. Started by the guest's
-init before any workload.
+A small static Rust binary in every template. Started by the guest's init
+before any workload.
+
+- **The platform adds the guest agent and init, not the template build.**
+  From M3, templates are built in untrusted machines (§12). The guest agent,
+  init and their config go on a read-only layer that the platform adds after
+  the build, outside the build machine, and that the build's files cannot
+  shadow. The template signature covers this layer. Otherwise every in-guest
+  wall would be code the attacker wrote.
+- **Fresh entropy at every boot.** The host passes a random seed; the guest
+  agent mixes it into the kernel's pool before any workload, so machines
+  from one template or one disk branch never share random state.
 
 - **The host connects in; the guest never dials out.** At boot the guest agent
   binds its vsock port (one fixed port) before any workload exists, so no other
@@ -447,9 +467,12 @@ operator — is listed in `docs/threats.md`.
   and literal-IP requests go nowhere.
 - **The proxy connects upstream on IPv4 only** until IPv6 is designed.
 - **An operator deny list** adds addresses that are public but still inside:
-  at least the host's and the site's own public addresses. On a home network,
-  a request to the site's own public IP can loop back through the router into
-  the LAN (hairpin NAT), and the global-address rule cannot see that.
+  at least the host's and the site's own public addresses, and the control
+  plane's and edge proxy's addresses. On a home network, a request to the
+  site's own public IP can loop back through the router into the LAN (hairpin
+  NAT), and the global-address rule cannot see that. A home WAN address
+  changes, so the host agent looks up its own public address on a timer and
+  updates the list; the wall check probes it.
 - Two TLS modes, chosen per rule:
   - **Intercepted** — required for any rule with `methods` or `pathPrefix`,
     and for secret grants. The proxy terminates TLS, requires the HTTP
@@ -619,6 +642,8 @@ with proof.
   calls, API side effects. Policy, grants and revocations live outside the
   machine and are not rolled back.
 - **Branching.** Restoring a snapshot into a *new* machine forks the state.
+  The new machine gets new placeholders; old ones copied in its files are
+  bound to the old machine (§8), so the proxy refuses them.
 - **Memory snapshots (driver 2).** Clones are made only from pristine template
   snapshots, never from a machine that has run user code. Each clone gets new
   identity: machine ID, placeholders, guest-agent session, and fresh entropy
@@ -718,6 +743,12 @@ and arm64 Linux hosts work.
 Until a second host exists, service mode runs only trusted test apps; no
 production service shares a host with untrusted machines.
 
+**Hardening for `untrusted` hosts.** A patched, pinned host kernel and
+libkrun; current CPU microcode; all CPU side-channel mitigations on; SMT
+(hyper-threads) off. The egress proxy and its keys still share the CPUs with
+untrusted machines, so side channels are narrowed, not closed. Moving the
+proxy to its own host is a later option.
+
 macOS binaries that use Hypervisor.framework must be code-signed with the
 `com.apple.security.hypervisor` entitlement (an ad-hoc signature is enough
 locally).
@@ -745,7 +776,7 @@ locally).
 | | Scope | Done when |
 |---|---|---|
 | **M0** | **On the Mac.** `sandpiper-vmm` boots an arm64 Linux rootfs with libkrun. The guest agent binds vsock; the host connects, sends one `exec`, gets stdout, stderr and exit code back; the machine is destroyed. Wire format fixed. | `hello` comes back over vsock in < 1 s from process start, repeatably. |
-| **M1** | **On a Linux KVM box.** Host agent + thin control API, one host, one prebuilt **trusted** template on a block image, built for the box's architecture. `create/exec/destroy`, stdin, output caps, TTLs. Sandboxed VMM processes, cgroup limits, TSI off, **`egress: none`: no network device, host firewall as second layer** (§7.3), workloads as an unprivileged uid with `AF_VSOCK` refused, wall checks with canaries (§4.2). Fuzzed guest frame decoder. Event log with replay. TS client. | Litro `run-code` works end to end in the playground; a machine cannot reach the LAN or internet; a VMM started with TSI on, or with a network device on an `egress: none` machine, is marked `failed` by the wall check. |
+| **M1** | **On a Linux KVM box.** Host agent + thin control API, one host, one prebuilt **trusted** template on a block image, built for the box's architecture. `create/exec/destroy`, stdin, output caps, TTLs. Sandboxed VMM processes, cgroup limits, TSI off, **`egress: none`: no network device, host firewall as second layer** (§7.3), workloads as an unprivileged uid with `AF_VSOCK` refused, wall checks with canaries (§4.2). Fuzzed guest frame decoder in the VMM process, fresh entropy seed per boot, hardened host (§12). Event log with replay. TS client. | Litro `run-code` works end to end in the playground; a machine cannot reach the LAN or internet; a VMM started with TSI on, or with a network device on an `egress: none` machine, is marked `failed` by the wall check. |
 | **M2** | Policy language and compiler (§7.1), in-guest confinement, egress proxy with allow-list, DNS/IP rules and a CA per machine for intercepted rules, starter presets and blocked-hosts view (§7.3, §8). Wall check adds proxy probes: a denied name gets no answer, a literal IP and each refused range are refused, a direct connection that skips the proxy is dropped. Fuzzed proxy parsers. Work out as git objects (§11.3). Signed host releases (§12). | A suite of escape attempts, one per M1 and M2 row of `docs/threats.md`, all fail and all appear in the log. |
 | **M3** | Secrets via placeholders and the credential-call deny list (§8), audit chain + seals + off-host checkpoints (§9), disk snapshots and restore (§10). Template builds from OCI/Dockerfile, run inside untrusted machines; signed templates (§12). | An agent calls a paid API with a key it never receives; audit verifies offline. |
 | **M4** | Service mode on a separate host: persistent volumes, edge proxy with registered domains, deploy with health-checked swap, restart on crash, promotion. | A Litro app is served on its own domain from this platform. |
