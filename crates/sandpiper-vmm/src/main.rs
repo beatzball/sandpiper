@@ -474,10 +474,7 @@ fn stop(child: &mut Child) {
     // what it started before the supervisor itself, so the machine never
     // outlives the one process that could still kill it.
     #[cfg(target_os = "linux")]
-    for pid in sandbox::children_of(child.id()) {
-        // SAFETY: an unreaped child of a live supervisor; see children_of.
-        unsafe { libc::kill(pid, libc::SIGKILL) };
-    }
+    sandbox::kill_children_of(child.id());
     let _ = child.kill();
 }
 

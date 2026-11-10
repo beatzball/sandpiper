@@ -232,15 +232,45 @@ pub fn enter(
     Ok(alive)
 }
 
-/// The processes a supervisor started: its VMM, the init of the machine's
-/// PID namespace. While the supervisor lives (even stopped) it has not
-/// reaped them, so their pids cannot have been reused.
-pub fn children_of(supervisor: u32) -> Vec<libc::pid_t> {
-    fs::read_to_string(format!("/proc/{supervisor}/task/{supervisor}/children"))
-        .unwrap_or_default()
+/// SIGKILL what a supervisor started (its VMM, the init of the machine's
+/// PID namespace), for when the supervisor itself does not act.
+///
+/// A pid read from /proc can be reaped and reused before it is signalled,
+/// so each one is pinned with a pidfd first, then checked to still be the
+/// supervisor's child, and only then signalled through the pidfd. If the
+/// pid was reused before the pidfd was opened, the parent check fails; if
+/// after, the pidfd still names the old, dead process and the signal goes
+/// nowhere.
+pub fn kill_children_of(supervisor: u32) {
+    let pids = fs::read_to_string(format!("/proc/{supervisor}/task/{supervisor}/children"))
+        .unwrap_or_default();
+    for pid in pids
         .split_whitespace()
-        .filter_map(|p| p.parse().ok())
-        .collect()
+        .filter_map(|p| p.parse::<libc::pid_t>().ok())
+    {
+        // SAFETY: pidfd syscalls on a descriptor we own and close.
+        unsafe {
+            let pidfd = libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int;
+            if pidfd < 0 {
+                continue;
+            }
+            let parent = fs::read_to_string(format!("/proc/{pid}/status"))
+                .unwrap_or_default()
+                .lines()
+                .find_map(|l| l.strip_prefix("PPid:"))
+                .and_then(|v| v.trim().parse::<u32>().ok());
+            if parent == Some(supervisor) {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd,
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+            libc::close(pidfd);
+        }
+    }
 }
 
 /// The supervisor: stays root and outside the PID namespace (it shares the
@@ -463,16 +493,40 @@ pub fn install_filter(filter: &[libc::sock_filter]) -> io::Result<()> {
 }
 
 /// Test the walls from inside, as the VMM will run: in the jail, as the
-/// machine's uid, under the filter. Prints one line per wall and returns 0
-/// if all held.
+/// machine's uid, under the filter. Prints one line per wall (`blocked`,
+/// `open`, or `inconclusive` when the host refuses the call even without
+/// the filter) and returns 0 only if every wall is `blocked`.
 pub fn probe_walls(uid: u32, gid: u32) -> i32 {
     let ready = drop_groups()
         .and_then(|()| limit_resources(1 << 20))
         // SAFETY: setgid then setuid, as libkrun does at start.
         .and_then(|()| os(unsafe { libc::setgid(gid) }).map(drop))
-        .and_then(|()| os(unsafe { libc::setuid(uid) }).map(drop))
-        .and_then(|()| install_filter(&vmm_filter()));
+        .and_then(|()| os(unsafe { libc::setuid(uid) }).map(drop));
     if let Err(e) = ready {
+        eprintln!("probe setup failed: {e}");
+        return 2;
+    }
+    // Calls an unprivileged process may usually make. A failure under the
+    // filter proves the filter only if the same call works without it, so
+    // each is tried once before the filter goes on.
+    // SAFETY: plain syscalls; any descriptor made is closed at once.
+    let try_userfaultfd = || unsafe {
+        let fd = libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | 1); // UFFD_USER_MODE_ONLY
+        if fd >= 0 {
+            libc::close(fd as i32);
+        }
+        fd >= 0
+    };
+    let try_io_uring = || unsafe {
+        let mut params = [0u8; 120]; // struct io_uring_params
+        let fd = libc::syscall(libc::SYS_io_uring_setup, 1, params.as_mut_ptr());
+        if fd >= 0 {
+            libc::close(fd as i32);
+        }
+        fd >= 0
+    };
+    let controls = [try_userfaultfd(), try_io_uring()];
+    if let Err(e) = install_filter(&vmm_filter()) {
         eprintln!("probe setup failed: {e}");
         return 2;
     }
@@ -497,46 +551,43 @@ pub fn probe_walls(uid: u32, gid: u32) -> i32 {
             libc::waitpid(clone as i32, std::ptr::null_mut(), 0);
         }
         [
-            ("vsock", fd < 0),
-            ("userns", libc::unshare(libc::CLONE_NEWUSER) != 0),
-            ("clone-userns", clone < 0),
-            ("ptrace", libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) != 0),
+            ("vsock", Some(fd < 0)),
+            ("userns", Some(libc::unshare(libc::CLONE_NEWUSER) != 0)),
+            ("clone-userns", Some(clone < 0)),
+            (
+                "ptrace",
+                Some(libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) != 0),
+            ),
             (
                 "mount",
-                libc::mount(
-                    c"none".as_ptr(),
-                    c"/machine".as_ptr(),
-                    c"tmpfs".as_ptr(),
-                    0,
-                    std::ptr::null(),
-                ) != 0,
+                Some(
+                    libc::mount(
+                        c"none".as_ptr(),
+                        c"/machine".as_ptr(),
+                        c"tmpfs".as_ptr(),
+                        0,
+                        std::ptr::null(),
+                    ) != 0,
+                ),
             ),
-            // Unprivileged processes may make these by default, so only the
-            // filter refuses them.
-            ("userfaultfd", {
-                let fd = libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | 1); // UFFD_USER_MODE_ONLY
-                if fd >= 0 {
-                    libc::close(fd as i32);
-                }
-                fd < 0
-            }),
-            ("io_uring", {
-                let mut params = [0u8; 120];
-                let fd = libc::syscall(libc::SYS_io_uring_setup, 1, params.as_mut_ptr());
-                if fd >= 0 {
-                    libc::close(fd as i32);
-                }
-                fd < 0
-            }),
-            ("host-files", fs::metadata("/etc/passwd").is_err()),
-            ("root-readonly", fs::File::create("/probe").is_err()),
-            ("uid", libc::geteuid() != 0 && libc::getegid() != 0),
+            // None: the call failed even without the filter, so its failure
+            // under the filter proves nothing.
+            ("userfaultfd", controls[0].then(|| !try_userfaultfd())),
+            ("io_uring", controls[1].then(|| !try_io_uring())),
+            ("host-files", Some(fs::metadata("/etc/passwd").is_err())),
+            ("root-readonly", Some(fs::File::create("/probe").is_err())),
+            ("uid", Some(libc::geteuid() != 0 && libc::getegid() != 0)),
         ]
     };
     let mut all = true;
     for (name, blocked) in results {
-        println!("{name} {}", if blocked { "blocked" } else { "open" });
-        all &= blocked;
+        let word = match blocked {
+            Some(true) => "blocked",
+            Some(false) => "open",
+            None => "inconclusive",
+        };
+        println!("{name} {word}");
+        all &= blocked == Some(true);
     }
     if all { 0 } else { 1 }
 }
