@@ -12,7 +12,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Toolchain
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
@@ -36,20 +36,22 @@ jobs:
     runs-on: ubuntu-latest
     env:
       LIBKRUN_VERSION: v1.19.7
+      LIBKRUN_COMMIT: 43b2f5aadeebb90f42053c9df2ec8b16583e554f
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal --component clippy
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         id: krun
         with:
           path: ~/krun
-          key: libkrun-${{ env.LIBKRUN_VERSION }}-blk-net-${{ runner.os }}-${{ runner.arch }}
+          key: libkrun-${{ env.LIBKRUN_COMMIT }}-blk-net-${{ runner.os }}-${{ runner.arch }}
       - name: Build libkrun
         if: steps.krun.outputs.cache-hit != 'true'
         run: |
           sudo apt-get install -y -qq libclang-dev
           git clone -q --depth 1 -b "$LIBKRUN_VERSION" https://github.com/containers/libkrun.git /tmp/libkrun
+          test "$(git -C /tmp/libkrun rev-parse HEAD)" = "$LIBKRUN_COMMIT"
           make -C /tmp/libkrun BLK=1 NET=1 -j"$(nproc)"
           make -C /tmp/libkrun BLK=1 NET=1 install PREFIX="$HOME/krun"
       - name: Build and test the VMM

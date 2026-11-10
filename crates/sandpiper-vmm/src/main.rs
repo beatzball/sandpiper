@@ -9,9 +9,12 @@
 //!
 //! `--disk` boots from an ext4 image; `run` gives each machine its own copy.
 //! On Linux, `run` as root sandboxes the VMM (see `sandbox`): its own
-//! namespaces and uid, only its machine's files, a seccomp filter. Without
+//! namespaces and uid, only its machine's files, a seccomp filter, and a
+//! root supervisor that kills the machine when the driver goes. Without
 //! root it warns and runs unsandboxed, for development; setting
-//! `SANDPIPER_UNSANDBOXED=1` acknowledges that and silences the warning.
+//! `SANDPIPER_UNSANDBOXED=1` acknowledges that, silences the warning, and
+//! skips the sandbox even as root. `run --probe` tests the sandbox's walls
+//! from inside instead of running a command.
 //!
 //! `boot` enters the VM and never returns. `run` is the M0 driver: it starts
 //! a `boot` child, connects to the guest agent, runs one command, prints its
@@ -69,6 +72,7 @@ struct Opts {
     stdin: bool,
     time: bool,
     die_with_parent: bool,
+    probe: bool,
     argv: Vec<String>,
 }
 
@@ -86,6 +90,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         stdin: false,
         time: false,
         die_with_parent: false,
+        probe: false,
         argv: Vec::new(),
     };
     let mut it = args.iter();
@@ -130,6 +135,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--stdin" => o.stdin = true,
             "--time" => o.time = true,
             "--die-with-parent" => o.die_with_parent = true,
+            "--probe" => o.probe = true,
             "--" => {
                 o.argv = it.cloned().collect();
                 break;
@@ -166,10 +172,13 @@ fn usage(err: &str) -> ExitCode {
     eprintln!(
         "usage: sandpiper-vmm boot (--root DIR | --disk IMAGE) --socket PATH [--cpus N] [--mem MIB]"
     );
-    eprintln!("                          [--die-with-parent] [--jail DIR --uid N --gid N]");
+    eprintln!(
+        "                          [--die-with-parent] [--jail DIR --uid N --gid N [--probe]]"
+    );
     eprintln!(
         "       sandpiper-vmm run (--root DIR | --disk IMAGE) [--timeout SECS] [--stdin] [--time] -- CMD [ARGS...]"
     );
+    eprintln!("       sandpiper-vmm run --disk IMAGE --probe");
     ExitCode::from(2)
 }
 
@@ -184,7 +193,22 @@ fn boot(o: &Opts) -> io::Result<std::convert::Infallible> {
     let run_as = match (&o.jail, o.uid, o.gid) {
         (None, None, None) => None,
         (Some(jail), Some(uid), Some(gid)) => {
-            enter_jail(Path::new(jail), &mut socket, &mut disk, uid, gid)?;
+            if uid < MIN_SANDBOX_ID || gid < MIN_SANDBOX_ID {
+                return Err(io::Error::other(format!(
+                    "a sandboxed VMM's uid and gid must be at least {MIN_SANDBOX_ID}"
+                )));
+            }
+            enter_jail(
+                Path::new(jail),
+                &mut socket,
+                &mut disk,
+                uid,
+                gid,
+                o.die_with_parent,
+            )?;
+            if o.probe {
+                probe_walls(uid, gid);
+            }
             Some((uid, gid))
         }
         _ => return Err(io::Error::other("--jail, --uid and --gid go together")),
@@ -211,7 +235,9 @@ fn boot(o: &Opts) -> io::Result<std::convert::Infallible> {
                     Err(_) => break,
                 }
             }
-            std::process::exit(EXIT_SANDPIPER.into());
+            // SAFETY: _exit skips destructors that would race libkrun's
+            // running threads.
+            unsafe { libc::_exit(EXIT_SANDPIPER.into()) };
         });
     }
     let root = match (&o.root, &disk) {
@@ -228,7 +254,7 @@ fn boot(o: &Opts) -> io::Result<std::convert::Infallible> {
         exec_path: GUEST_AGENT,
         env: GUEST_ENV,
         run_as,
-        before_enter: &|| before_enter(run_as.is_some()),
+        before_enter: &|| before_enter(run_as.is_some(), disk.as_deref()),
     })
 }
 
@@ -241,6 +267,7 @@ fn enter_jail(
     disk: &mut Option<String>,
     uid: u32,
     gid: u32,
+    lifeline: bool,
 ) -> io::Result<()> {
     let machine = jail.join("machine");
     let inside = |p: &str| -> io::Result<String> {
@@ -254,7 +281,7 @@ fn enter_jail(
     };
     let new_socket = inside(socket)?;
     let new_disk = disk.as_deref().map(inside).transpose()?;
-    let alive = sandbox::enter(jail, &machine, uid, gid)?;
+    let alive = sandbox::enter(jail, &machine, uid, gid, lifeline)?;
     thread::spawn(move || sandbox::exit_with_parent(alive));
     *socket = new_socket;
     *disk = new_disk;
@@ -262,13 +289,40 @@ fn enter_jail(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn enter_jail(_: &Path, _: &mut String, _: &mut Option<String>, _: u32, _: u32) -> io::Result<()> {
+fn enter_jail(
+    _: &Path,
+    _: &mut String,
+    _: &mut Option<String>,
+    _: u32,
+    _: u32,
+    _: bool,
+) -> io::Result<()> {
     Err(io::Error::other("the VMM sandbox needs Linux"))
 }
 
 #[cfg(target_os = "linux")]
-fn before_enter(jailed: bool) -> io::Result<()> {
+const MIN_SANDBOX_ID: u32 = sandbox::MIN_ID;
+#[cfg(not(target_os = "linux"))]
+const MIN_SANDBOX_ID: u32 = 100_000;
+
+#[cfg(target_os = "linux")]
+fn probe_walls(uid: u32, gid: u32) -> ! {
+    std::process::exit(sandbox::probe_walls(uid, gid))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_walls(_: u32, _: u32) -> ! {
+    std::process::exit(2)
+}
+
+#[cfg(target_os = "linux")]
+fn before_enter(jailed: bool, disk: Option<&str>) -> io::Result<()> {
     if jailed {
+        let disk_size = match disk {
+            Some(d) => fs::metadata(d)?.len(),
+            None => 0,
+        };
+        sandbox::limit_resources(disk_size.max(1 << 20))?;
         sandbox::drop_groups()?;
         sandbox::install_filter(&sandbox::vmm_filter())?;
     }
@@ -276,7 +330,7 @@ fn before_enter(jailed: bool) -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn before_enter(_: bool) -> io::Result<()> {
+fn before_enter(_: bool, _: Option<&str>) -> io::Result<()> {
     Ok(())
 }
 
@@ -391,9 +445,27 @@ impl Machine {
 impl Drop for Machine {
     fn drop(&mut self) {
         let mut child = self.0.lock().expect("child lock");
-        let _ = child.kill();
+        stop(&mut child);
         let _ = child.wait();
     }
+}
+
+/// Stop a VMM. SIGTERM first: a sandboxed VMM's supervisor turns it into a
+/// SIGKILL for the whole machine, which a SIGKILL to the supervisor itself
+/// would not. SIGKILL if it is still there after two seconds.
+fn stop(child: &mut Child) {
+    if let Ok(Some(_)) = child.try_wait() {
+        return;
+    }
+    // SAFETY: the pid is our unreaped child, so it cannot have been reused.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    for _ in 0..100 {
+        if let Ok(Some(_)) = child.try_wait() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
 }
 
 /// Kills the VMM when the current deadline passes, whatever the main thread
@@ -426,7 +498,7 @@ impl Watchdog {
                 }
                 if Instant::now() >= st.deadline {
                     st.fired = true;
-                    let _ = child.lock().expect("child lock").kill();
+                    stop(&mut child.lock().expect("child lock"));
                     return;
                 }
             }
@@ -456,15 +528,32 @@ enum Outcome {
     TimedOut,
 }
 
-/// Whether `run` can sandbox the VMM here: Linux, as root.
-fn can_sandbox() -> bool {
-    // SAFETY: geteuid has no preconditions.
-    cfg!(target_os = "linux") && unsafe { libc::geteuid() } == 0
-}
+/// Base of the per-machine uids `run` uses: far above login users and the
+/// usual /etc/subuid ranges. Adding the driver's pid makes every live
+/// machine's uid distinct. The host agent allocates these from part 2 on.
+const RUN_ID_BASE: u32 = 1_800_000_000;
 
 fn run(o: &Opts) -> io::Result<ExitCode> {
-    if o.argv.is_empty() {
+    if o.argv.is_empty() && !o.probe {
         return Err(io::Error::other("no command given after --"));
+    }
+    // SAFETY: geteuid has no preconditions.
+    let root = unsafe { libc::geteuid() } == 0;
+    let acknowledged = std::env::var_os("SANDPIPER_UNSANDBOXED").is_some();
+    let sandboxed = cfg!(target_os = "linux") && root && !acknowledged;
+    if sandboxed && o.root.is_some() {
+        return Err(io::Error::other(
+            "--root (a host directory) cannot be sandboxed; use --disk, or set SANDPIPER_UNSANDBOXED=1",
+        ));
+    }
+    if o.probe && !sandboxed {
+        return Err(io::Error::other(
+            "--probe tests the sandbox: run as root on Linux",
+        ));
+    }
+    if cfg!(target_os = "linux") && !sandboxed && !acknowledged {
+        // Set SANDPIPER_UNSANDBOXED=1 to say this is known and wanted.
+        eprintln!("sandpiper-vmm: not root, so the VMM is NOT sandboxed (development only)");
     }
     let scratch = Scratch::new()?;
     let machine = scratch.0.join("machine");
@@ -486,9 +575,8 @@ fn run(o: &Opts) -> io::Result<ExitCode> {
         }
         _ => return Err(io::Error::other("give exactly one of --root and --disk")),
     }
-    if can_sandbox() {
-        // One uid per machine; the host agent allocates these from M1 on.
-        let id = 200_000 + std::process::id() % 100_000;
+    let machine_uid = sandboxed.then(|| RUN_ID_BASE + std::process::id());
+    if let Some(id) = machine_uid {
         chown_tree(&machine, id)?;
         boot.arg("--jail").arg(&scratch.0).args([
             "--uid",
@@ -496,9 +584,10 @@ fn run(o: &Opts) -> io::Result<ExitCode> {
             "--gid",
             &id.to_string(),
         ]);
-    } else if cfg!(target_os = "linux") && std::env::var_os("SANDPIPER_UNSANDBOXED").is_none() {
-        // Set SANDPIPER_UNSANDBOXED=1 to say this is known and wanted.
-        eprintln!("sandpiper-vmm: not root, so the VMM is NOT sandboxed (development only)");
+    }
+    if o.probe {
+        let status = boot.arg("--socket").arg(&socket).arg("--probe").status()?;
+        return Ok(ExitCode::from(status.code().unwrap_or(125) as u8));
     }
     let (lifeline_r, lifeline_w) = io::pipe()?;
     let mut child = boot
@@ -518,7 +607,7 @@ fn run(o: &Opts) -> io::Result<ExitCode> {
     let machine = Machine(Arc::new(Mutex::new(child)));
     let watchdog = Watchdog::start(Arc::clone(&machine.0), started + BOOT_TIMEOUT);
 
-    let outcome = exchange(o, &socket, &machine, &watchdog, started);
+    let outcome = exchange(o, &socket, machine_uid, &machine, &watchdog, started);
     watchdog.stop();
     // Destroy the machine, then let the console readers drain to EOF so a
     // report shows the VMM's last words.
@@ -566,14 +655,21 @@ fn run(o: &Opts) -> io::Result<ExitCode> {
     }
 }
 
+/// One exec over the guest agent's socket.
+///
+/// Known gap: this driver decodes guest frames in its own process, which is
+/// root when the VMM is sandboxed. DESIGN.md §4.2 has the sandboxed VMM side
+/// decode and hand the root host agent only typed messages; the host agent
+/// (M1 part 2) is built that way and replaces this driver.
 fn exchange(
     o: &Opts,
     socket: &Path,
+    peer_uid: Option<u32>,
     machine: &Machine,
     watchdog: &Watchdog,
     started: Instant,
 ) -> io::Result<Outcome> {
-    let mut conn = match connect(socket, machine, watchdog)? {
+    let mut conn = match connect(socket, peer_uid, machine, watchdog)? {
         Some(conn) => conn,
         None => return Ok(Outcome::TimedOut),
     };
@@ -677,6 +773,7 @@ impl<W: Write> CappedSink<W> {
 /// watchdog fired during boot.
 fn connect(
     socket: &Path,
+    peer_uid: Option<u32>,
     machine: &Machine,
     watchdog: &Watchdog,
 ) -> io::Result<Option<UnixStream>> {
@@ -706,6 +803,17 @@ fn connect(
         }
         match UnixStream::connect(socket) {
             Ok(mut conn) => {
+                // The machine's directory belongs to its uid, so the path
+                // could have been swapped for a link to another socket.
+                // Speak only to the machine's own VMM.
+                if let Some(want) = peer_uid {
+                    let got = peer_uid_of(&conn)?;
+                    if got != want {
+                        return Err(io::Error::other(format!(
+                            "socket peer is uid {got}, not the machine's uid {want}; refusing"
+                        )));
+                    }
+                }
                 conn.set_read_timeout(Some(Duration::from_millis(500)))?;
                 match read_frame(&mut conn) {
                     Ok(Some(Frame::Ready { version })) if version == PROTOCOL_VERSION => {
@@ -732,6 +840,37 @@ fn connect(
         }
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid_of(conn: &UnixStream) -> io::Result<u32> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: getsockopt into a correctly sized ucred.
+    let rc = unsafe {
+        libc::getsockopt(
+            std::os::fd::AsRawFd::as_raw_fd(conn),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(cred.uid)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_uid_of(_: &UnixStream) -> io::Result<u32> {
+    Err(io::Error::other(
+        "peer credentials are checked on Linux only",
+    ))
 }
 
 /// Cut guest-supplied text to `max` bytes and escape control characters, so

@@ -207,7 +207,10 @@ fn wait_or_hangup(
             return Ok(Some(status));
         }
         if hangup.load(Ordering::Relaxed) {
-            let _ = child.kill();
+            // The whole group: the command and anything it left running. The
+            // group cannot be reused while the child is unreaped.
+            // SAFETY: kill with a negative pid signals the process group.
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
             let _ = child.wait();
             return Ok(None);
         }
@@ -392,6 +395,8 @@ fn command(req: &ExecRequest) -> Command {
     // std drops supplementary groups, then sets gid and uid, then runs the
     // pre_exec hook, so the filter is installed by the unprivileged child.
     cmd.uid(confine::WORKLOAD_UID).gid(confine::WORKLOAD_GID);
+    // Its own process group, so a hang-up kills everything it started.
+    cmd.process_group(0);
     // SAFETY: `apply` makes only async-signal-safe calls (prctl).
     unsafe {
         cmd.pre_exec(move || confine::apply(&filter));

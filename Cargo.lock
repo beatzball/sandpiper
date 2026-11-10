@@ -48,6 +48,7 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "sandpiper-proto",
+ "sandpiper-seccomp",
 ]
 
 [[package]]
@@ -59,11 +60,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandpiper-seccomp"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "sandpiper-vmm"
 version = "0.0.0"
 dependencies = [
  "libc",
  "sandpiper-proto",
+ "sandpiper-seccomp",
 ]
 
 [[package]]

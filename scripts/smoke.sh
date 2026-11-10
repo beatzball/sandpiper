@@ -50,13 +50,16 @@ sleep 2
 kill -9 "$driver" 2>/dev/null; wait "$driver" 2>/dev/null
 sleep 1
 check "VMM dies when its driver is SIGKILLed" "" "$(pgrep -f 'sandpiper-vmm boot')"
-check "no leftover VMMs"  "" "$(pgrep -f 'sandpiper-vmm boot')"
 
 if [ "$MODE" = m1 ]; then
   # Walls inside the guest (DESIGN.md §4.4).
   check "workload runs as uid 1000" "1000" "$(run -- id -u 2>/dev/null)"
   check "workload cannot open vsock" "blocked" "$(run -- /sandpiper/guest probe vsock 2>/dev/null)"
   check "workload cannot use io_uring" "blocked" "$(run -- /sandpiper/guest probe io_uring 2>/dev/null)"
+  check "workload cannot make a user namespace" "blocked" "$(run -- /sandpiper/guest probe userns 2>/dev/null)"
+  check "workload cannot clone into a user namespace" "blocked" \
+    "$(run -- /sandpiper/guest probe clone-userns 2>/dev/null)"
+  check "workload cannot ptrace" "blocked" "$(run -- /sandpiper/guest probe ptrace 2>/dev/null)"
   check "system files belong to root" "0" "$(run -- stat -c %u /bin/busybox 2>/dev/null)"
   check "workload cannot write system files" "denied" \
     "$(run -- sh -c 'echo x > /etc/passwd 2>/dev/null && echo written || echo denied' 2>/dev/null)"
@@ -86,6 +89,30 @@ if [ "$MODE" = m1 ]; then
   check "VMM's network namespace has no devices but lo" "lo" \
     "$(nsenter -t "$vmm" -n ip -o link show | awk -F': ' '{print $2}' | tr '\n' ' ' | sed 's/ $//')"
   kill "$driver" 2>/dev/null; wait "$driver" 2>/dev/null
+
+  # The VMM's walls from inside: in the jail, as its uid, under its filter.
+  probe=$("$V" run "${ROOT[@]}" --probe 2>&1)
+  for wall in vsock userns clone-userns ptrace mount host-files root-readonly uid; do
+    check "jailed VMM: $wall" "$wall blocked" "$(grep "^$wall " <<<"$probe")"
+  done
+
+  # A VMM that stops cooperating (stopped, so its own threads cannot react)
+  # still dies with its driver: the root supervisor kills it.
+  "$V" run "${ROOT[@]}" --timeout 60 -- sleep 60 >/dev/null 2>&1 &
+  driver=$!
+  vmm=""
+  for _ in $(seq 1 100); do
+    vmm=$(pgrep -f 'sandpiper-vmm boot' | while read -r p; do
+      [ "$(stat -c %u /proc/$p)" != 0 ] && echo "$p"; done | head -1)
+    [ -n "$vmm" ] && break
+    sleep 0.1
+  done
+  kill -STOP "$vmm"
+  kill -9 "$driver"; wait "$driver" 2>/dev/null
+  sleep 1
+  check "an uncooperative VMM dies with its driver" "gone" "$(kill -0 "$vmm" 2>/dev/null && echo alive || echo gone)"
 fi
+
+check "no leftover VMMs" "" "$(pgrep -f 'sandpiper-vmm boot')"
 
 [ "$fails" -eq 0 ] && echo "all checks passed" || { echo "$fails check(s) failed"; exit 1; }

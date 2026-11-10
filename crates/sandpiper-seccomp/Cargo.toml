@@ -1,0 +1,11 @@
+[package]
+name = "sandpiper-seccomp"
+version = "0.0.0"
+description = "Small seccomp filters for the sandpiper VMM and guest agent."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true

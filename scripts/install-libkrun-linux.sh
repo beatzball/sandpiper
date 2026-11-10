@@ -7,6 +7,8 @@ set -euo pipefail
 
 LIBKRUNFW_VERSION=v5.6.2
 LIBKRUN_VERSION=v1.19.7
+# Tags can move; the commit cannot.
+LIBKRUN_COMMIT=43b2f5aadeebb90f42053c9df2ec8b16583e554f
 ARCH=$(uname -m)
 case "$ARCH" in
   aarch64) FW_SHA256=dea7905a167eee17d482200ea2fe15871aceb293b0674ac825ed7ae69759399f ;;
@@ -26,6 +28,8 @@ sudo ln -sf "libkrunfw.so.${LIBKRUNFW_VERSION#v}" /usr/local/lib/libkrunfw.so.5
 sudo ln -sf libkrunfw.so.5 /usr/local/lib/libkrunfw.so
 
 git clone -q --depth 1 -b "$LIBKRUN_VERSION" https://github.com/containers/libkrun.git "$work/libkrun"
+[ "$(git -C "$work/libkrun" rev-parse HEAD)" = "$LIBKRUN_COMMIT" ] || {
+  echo "install-libkrun: $LIBKRUN_VERSION is not commit $LIBKRUN_COMMIT" >&2; exit 1; }
 make -C "$work/libkrun" BLK=1 NET=1 -j"$(nproc)"
 sudo make -C "$work/libkrun" BLK=1 NET=1 install PREFIX=/usr/local
 

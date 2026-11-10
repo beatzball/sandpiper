@@ -6,12 +6,16 @@
 //!
 //! The process must start as root. Order:
 //!
-//! 1. [`enter`]: new namespaces, fork (the child is PID 1 of the new PID
-//!    namespace; the parent only waits and passes on the exit code), then
-//!    a minimal root built on a tmpfs with `pivot_root`.
-//! 2. libkrun is configured: it opens `/dev/kvm` and the disk as root.
-//! 3. [`drop_groups`] and [`install_filter`] run in `before_enter`.
-//! 4. `krun_start_enter` switches to the machine's uid and starts the guest.
+//! 1. [`enter`]: new namespaces and a fork. The child becomes PID 1 of the
+//!    new PID namespace and goes on; the parent becomes its **supervisor**
+//!    (see [`supervise`]). The child closes every inherited descriptor and
+//!    moves into a minimal root built on a tmpfs with `pivot_root`.
+//! 2. libkrun is configured; it records the disk and socket paths.
+//! 3. [`limit_resources`], [`drop_groups`] and [`install_filter`] run in
+//!    `before_enter`.
+//! 4. `krun_start_enter` switches to the machine's uid, then opens
+//!    `/dev/kvm` (hence the private node owned by that uid) and starts the
+//!    guest.
 
 use std::ffi::CString;
 use std::fs;
@@ -20,11 +24,19 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 
+use sandpiper_seccomp::{Filter, errno};
+
 /// Where the machine's directory appears inside the sandbox.
 pub const MACHINE_DIR: &str = "/machine";
 
+/// The lowest uid or gid a sandboxed VMM may run as.
+pub const MIN_ID: u32 = 100_000;
+
 /// World-usable device nodes, bound into the sandbox from the host.
 const DEVICES: &[&str] = &["/dev/null", "/dev/zero", "/dev/urandom"];
+
+/// The descriptor number the child keeps for its end of the parent pipe.
+const ALIVE_FD: libc::c_int = 3;
 
 fn os(rc: libc::c_int) -> io::Result<libc::c_int> {
     if rc < 0 {
@@ -68,10 +80,19 @@ fn mount(
 /// disk image and socket; inside, it is the only host directory visible, at
 /// [`MACHINE_DIR`]. Returns in the sandboxed child; the parent never returns.
 ///
-/// The returned descriptor hangs up when the parent exits. The caller must
-/// watch it and exit when it does: `PR_SET_PDEATHSIG` alone is not enough,
-/// because the kernel clears it when libkrun switches to the machine's uid.
-pub fn enter(scratch: &Path, machine: &Path, uid: u32, gid: u32) -> io::Result<OwnedFd> {
+/// With `lifeline`, stdin is a pipe from the driver: when it closes, the
+/// supervisor kills the machine.
+///
+/// The returned descriptor hangs up when the supervisor exits. Watching it
+/// is a courtesy for a well-behaved VMM; the supervisor's SIGKILL is what
+/// does not depend on the VMM's cooperation.
+pub fn enter(
+    scratch: &Path,
+    machine: &Path,
+    uid: u32,
+    gid: u32,
+    lifeline: bool,
+) -> io::Result<OwnedFd> {
     // libkrun loads its kernel library by name when the VM starts, which is
     // after the host filesystem is gone. Load it now; libkrun's own dlopen
     // then finds it already in the process.
@@ -97,43 +118,38 @@ pub fn enter(scratch: &Path, machine: &Path, uid: u32, gid: u32) -> io::Result<O
                 | libc::CLONE_NEWUTS,
         ))
         .map_err(|e| io::Error::other(format!("unshare: {e}")))?;
-        // The parent holds the write end of this pipe until it exits. The
-        // child cannot use getppid() to see whether the parent is still
-        // there: across a PID namespace it always reads 0.
+        // The supervisor holds the write end of this pipe until it exits.
+        // The child cannot use getppid() to see whether the supervisor is
+        // still there: across a PID namespace it always reads 0.
         os(libc::pipe2(alive.as_mut_ptr(), libc::O_CLOEXEC))?;
         let pid = os(libc::fork())?;
         if pid > 0 {
-            // The parent stays outside the PID namespace and only waits. If it
-            // is killed, the child gets SIGKILL from PR_SET_PDEATHSIG and the
-            // whole namespace goes with it.
             libc::close(alive[0]);
-            let mut status = 0;
-            while libc::waitpid(pid, &mut status, 0) < 0 {
-                if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                    libc::_exit(125);
-                }
-            }
-            let code = if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status)
-            } else {
-                128 + libc::WTERMSIG(status)
-            };
-            libc::_exit(code);
+            supervise(pid, lifeline);
         }
         libc::close(alive[1]);
+        // Covers the window until libkrun's uid switch, which clears it.
         os(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0))?;
-        // If the parent died before the signal was armed, the pipe has hung up.
         let mut pfd = libc::pollfd {
             fd: alive[0],
             events: libc::POLLIN,
             revents: 0,
         };
         if libc::poll(&mut pfd, 1, 0) != 0 {
-            libc::_exit(125);
+            libc::_exit(125); // the supervisor died before the signal was armed
         }
+        // Nothing the caller left open may follow the VMM into the jail: an
+        // inherited directory descriptor would reach around pivot_root.
+        // Keep stdio and the pipe, at a known number, and close the rest.
+        if alive[0] != ALIVE_FD {
+            os(libc::dup3(alive[0], ALIVE_FD, libc::O_CLOEXEC))?;
+            libc::close(alive[0]);
+        }
+        os(libc::syscall(libc::SYS_close_range, ALIVE_FD + 1, libc::c_uint::MAX, 0) as libc::c_int)
+            .map_err(|e| io::Error::other(format!("close_range: {e}")))?;
     }
-    // SAFETY: alive[0] is open and owned by nothing else from here on.
-    let alive = unsafe { OwnedFd::from_raw_fd(alive[0]) };
+    // SAFETY: ALIVE_FD is open and owned by nothing else from here on.
+    let alive = unsafe { OwnedFd::from_raw_fd(ALIVE_FD) };
 
     // Nothing done in here may reach the host's mount table.
     mount(
@@ -186,7 +202,8 @@ pub fn enter(scratch: &Path, machine: &Path, uid: u32, gid: u32) -> io::Result<O
     )?;
 
     // SAFETY: path arguments are valid C strings; pivot_root has no libc
-    // wrapper, so it goes through syscall().
+    // wrapper, so it goes through syscall(). It moves the root of every
+    // process in this mount namespace, the supervisor's too.
     unsafe {
         let dot = CString::new(".").expect("static");
         os(libc::chdir(c(&new_root)?.as_ptr()))?;
@@ -206,18 +223,109 @@ pub fn enter(scratch: &Path, machine: &Path, uid: u32, gid: u32) -> io::Result<O
     Ok(alive)
 }
 
-/// Block until `alive` hangs up (the parent is gone), then exit.
+/// The supervisor: stays root and outside the PID namespace (it shares the
+/// others, and the jail's root), and kills the machine — the whole PID
+/// namespace, by SIGKILL to its init — when the driver says so or is gone:
+///
+/// - SIGTERM, SIGINT or SIGHUP;
+/// - the driver's death (`PR_SET_PDEATHSIG`, delivered as SIGTERM; the
+///   supervisor never changes uid, so the kernel keeps it armed);
+/// - with `lifeline`, end of stdin.
+///
+/// None of this needs the VMM's cooperation. Exits with the VMM's status.
+fn supervise(child: libc::pid_t, lifeline: bool) -> ! {
+    // SAFETY: signal-mask, signalfd, pidfd and poll calls on descriptors
+    // made here; the process is single-threaded.
+    unsafe {
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        for s in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::sigaddset(&mut mask, s);
+        }
+        libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
+        let sfd = libc::signalfd(-1, &mask, libc::SFD_CLOEXEC);
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
+        let pidfd = libc::syscall(libc::SYS_pidfd_open, child, 0) as libc::c_int;
+        if sfd < 0 || pidfd < 0 {
+            libc::kill(child, libc::SIGKILL);
+        } else {
+            let mut fds = [
+                libc::pollfd {
+                    fd: pidfd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: sfd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: if lifeline { 0 } else { -1 },
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            loop {
+                if libc::poll(fds.as_mut_ptr(), 3, -1) < 0 {
+                    if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    libc::kill(child, libc::SIGKILL);
+                    break;
+                }
+                if fds[0].revents != 0 {
+                    break; // the VMM exited by itself
+                }
+                if fds[1].revents != 0 {
+                    libc::kill(child, libc::SIGKILL);
+                    break;
+                }
+                if fds[2].revents != 0 {
+                    let mut buf = [0u8; 64];
+                    let n = libc::read(0, buf.as_mut_ptr().cast(), buf.len());
+                    let retry = n < 0
+                        && matches!(
+                            io::Error::last_os_error().kind(),
+                            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                        );
+                    if n == 0 || (n < 0 && !retry) {
+                        libc::kill(child, libc::SIGKILL);
+                        break;
+                    }
+                }
+            }
+        }
+        let mut status = 0;
+        while libc::waitpid(child, &mut status, 0) < 0 {
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                libc::_exit(125);
+            }
+        }
+        let code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            128 + libc::WTERMSIG(status)
+        };
+        libc::_exit(code);
+    }
+}
+
+/// Block until `alive` hangs up (the supervisor is gone), then exit at once.
 pub fn exit_with_parent(alive: OwnedFd) -> ! {
     let mut pfd = libc::pollfd {
         fd: alive.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
-    // SAFETY: poll on a descriptor we own.
-    while unsafe { libc::poll(&mut pfd, 1, -1) } < 0
-        && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
-    {}
-    std::process::exit(125)
+    // SAFETY: poll on a descriptor we own; _exit skips destructors that
+    // would race libkrun's running threads.
+    unsafe {
+        while libc::poll(&mut pfd, 1, -1) < 0
+            && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+        {}
+        libc::_exit(125)
+    }
 }
 
 /// Drop root's supplementary groups; libkrun sets only the uid and gid.
@@ -226,22 +334,28 @@ pub fn drop_groups() -> io::Result<()> {
     os(unsafe { libc::setgroups(0, std::ptr::null()) }).map(drop)
 }
 
-#[cfg(target_arch = "aarch64")]
-const AUDIT_ARCH: u32 = 0xC000_00B7;
-#[cfg(target_arch = "x86_64")]
-const AUDIT_ARCH: u32 = 0xC000_003E;
-
-const LD_W_ABS: u16 = 0x20;
-const JEQ_K: u16 = 0x15;
-const JGE_K: u16 = 0x35;
-const RET_K: u16 = 0x06;
-const RET_ALLOW: u32 = 0x7fff_0000;
-const RET_KILL_PROCESS: u32 = 0x8000_0000;
-const RET_ERRNO: u32 = 0x0005_0000;
+/// Bound what the VMM's uid can use until cgroups take over (M1 part 2):
+/// processes and threads, open files, file size (the disk image is the only
+/// file it writes, and it never grows), and no core dumps.
+pub fn limit_resources(max_file: u64) -> io::Result<()> {
+    let set = |res, v: u64| {
+        let lim = libc::rlimit {
+            rlim_cur: v,
+            rlim_max: v,
+        };
+        // SAFETY: setrlimit with a valid struct.
+        os(unsafe { libc::setrlimit(res, &lim) }).map(drop)
+    };
+    set(libc::RLIMIT_NPROC, 512)?;
+    set(libc::RLIMIT_NOFILE, 1024)?;
+    set(libc::RLIMIT_FSIZE, max_file)?;
+    set(libc::RLIMIT_CORE, 0)
+}
 
 /// Syscalls a VMM never needs once the guest runs, and that an escape would
-/// use to widen its reach: other processes, mounts and namespaces, kernel
-/// modules and keys, BPF, perf, userfaultfd, raw handles, io_uring.
+/// use to widen its reach: other processes, mounts, kernel modules and keys,
+/// BPF, perf, userfaultfd, raw handles, io_uring. Namespaces and host vsock
+/// are refused by rules of their own in [`vmm_filter`].
 ///
 /// A deny list, not an allow list: libkrun's own syscall set is not pinned
 /// down yet. An allow list replaces this once it is (DESIGN.md §4.2).
@@ -254,8 +368,6 @@ fn denied() -> Vec<libc::c_long> {
         libc::SYS_umount2,
         libc::SYS_pivot_root,
         libc::SYS_chroot,
-        libc::SYS_unshare,
-        libc::SYS_setns,
         libc::SYS_fsopen,
         libc::SYS_fsmount,
         libc::SYS_fspick,
@@ -288,92 +400,123 @@ fn denied() -> Vec<libc::c_long> {
     v
 }
 
-fn ins(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
-    libc::sock_filter { code, jt, jf, k }
-}
-
+/// The VMM filter: [`denied`], no namespaces (a user namespace would give
+/// the VMM's uid capabilities over a new network namespace, and with them
+/// netfilter and netlink), and no host vsock (vsock is not scoped by
+/// network namespace; libkrun's own vsock device uses Unix sockets).
 pub fn vmm_filter() -> Vec<libc::sock_filter> {
-    let mut f = vec![
-        ins(LD_W_ABS, 4, 0, 0), // arch
-        ins(JEQ_K, AUDIT_ARCH, 1, 0),
-        ins(RET_K, RET_KILL_PROCESS, 0, 0),
-        ins(LD_W_ABS, 0, 0, 0), // nr
-    ];
-    if cfg!(target_arch = "x86_64") {
-        f.push(ins(JGE_K, 0x4000_0000, 0, 1));
-        f.push(ins(RET_K, RET_KILL_PROCESS, 0, 0));
-    }
+    let mut f = Filter::new();
     for nr in denied() {
-        f.push(ins(JEQ_K, nr as u32, 0, 1));
-        f.push(ins(RET_K, RET_ERRNO | libc::EPERM as u32, 0, 0));
+        f = f.deny(nr, errno(libc::EPERM));
     }
-    f.push(ins(RET_K, RET_ALLOW, 0, 0));
-    f
+    f.deny_namespaces()
+        .deny_arg0_eq(
+            libc::SYS_socket,
+            libc::AF_VSOCK as u32,
+            errno(libc::EAFNOSUPPORT),
+        )
+        .build()
 }
 
-/// Install the filter for every thread of the process. Threads libkrun
-/// starts later inherit it.
+/// Install the filter on every thread of the process; fails, installing
+/// nothing, if any thread cannot take it. Threads libkrun starts later
+/// inherit it.
 pub fn install_filter(filter: &[libc::sock_filter]) -> io::Result<()> {
-    let prog = libc::sock_fprog {
-        len: u16::try_from(filter.len()).map_err(|_| io::Error::other("filter too long"))?,
-        filter: filter.as_ptr().cast_mut(),
-    };
-    // SAFETY: valid arguments; the kernel copies the program.
-    unsafe {
-        os(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))?;
-        os(libc::syscall(
-            libc::SYS_seccomp,
-            libc::SECCOMP_SET_MODE_FILTER,
-            libc::SECCOMP_FILTER_FLAG_TSYNC,
-            &prog as *const libc::sock_fprog,
-        ) as libc::c_int)
-        .map_err(|e| io::Error::other(format!("seccomp: {e}")))?;
+    sandpiper_seccomp::install(filter, true).map_err(|e| io::Error::other(format!("seccomp: {e}")))
+}
+
+/// Test the walls from inside, as the VMM will run: in the jail, as the
+/// machine's uid, under the filter. Prints one line per wall and returns 0
+/// if all held.
+pub fn probe_walls(uid: u32, gid: u32) -> i32 {
+    let ready = drop_groups()
+        .and_then(|()| limit_resources(1 << 20))
+        // SAFETY: setgid then setuid, as libkrun does at start.
+        .and_then(|()| os(unsafe { libc::setgid(gid) }).map(drop))
+        .and_then(|()| os(unsafe { libc::setuid(uid) }).map(drop))
+        .and_then(|()| install_filter(&vmm_filter()));
+    if let Err(e) = ready {
+        eprintln!("probe setup failed: {e}");
+        return 2;
     }
-    Ok(())
+    // SAFETY: plain syscalls; anything that succeeds is undone or exits.
+    let results = unsafe {
+        let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
+        if fd >= 0 {
+            libc::close(fd);
+        }
+        let clone = libc::syscall(
+            libc::SYS_clone,
+            (libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_ulong,
+            0usize,
+            0usize,
+            0usize,
+            0usize,
+        );
+        if clone == 0 {
+            libc::_exit(0);
+        }
+        if clone > 0 {
+            libc::waitpid(clone as i32, std::ptr::null_mut(), 0);
+        }
+        [
+            ("vsock", fd < 0),
+            ("userns", libc::unshare(libc::CLONE_NEWUSER) != 0),
+            ("clone-userns", clone < 0),
+            ("ptrace", libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) != 0),
+            (
+                "mount",
+                libc::mount(
+                    c"none".as_ptr(),
+                    c"/machine".as_ptr(),
+                    c"tmpfs".as_ptr(),
+                    0,
+                    std::ptr::null(),
+                ) != 0,
+            ),
+            ("host-files", fs::metadata("/etc/passwd").is_err()),
+            ("root-readonly", fs::File::create("/probe").is_err()),
+            ("uid", libc::geteuid() != 0 && libc::getegid() != 0),
+        ]
+    };
+    let mut all = true;
+    for (name, blocked) in results {
+        println!("{name} {}", if blocked { "blocked" } else { "open" });
+        all &= blocked;
+    }
+    if all { 0 } else { 1 }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn eval(f: &[libc::sock_filter], arch: u32, nr: u32) -> u32 {
-        let (mut acc, mut pc) = (0u32, 0usize);
-        loop {
-            let i = f[pc];
-            pc += 1;
-            match i.code {
-                LD_W_ABS => acc = if i.k == 4 { arch } else { nr },
-                RET_K => return i.k,
-                JEQ_K | JGE_K => {
-                    let hit = if i.code == JEQ_K {
-                        acc == i.k
-                    } else {
-                        acc >= i.k
-                    };
-                    pc += usize::from(if hit { i.jt } else { i.jf });
-                }
-                c => panic!("opcode {c:#x}"),
-            }
-        }
-    }
+    use sandpiper_seccomp::{RET_ALLOW, simulate};
 
     #[test]
-    fn denies_the_listed_syscalls_and_allows_the_rest() {
+    fn vmm_filter_denies_what_it_lists_and_allows_the_rest() {
         let f = vmm_filter();
+        let s = |nr, a| simulate(&f, None, nr, a);
         for nr in denied() {
-            assert_eq!(
-                eval(&f, AUDIT_ARCH, nr as u32),
-                RET_ERRNO | libc::EPERM as u32
-            );
+            assert_eq!(s(nr, 0), errno(libc::EPERM));
         }
+        assert_eq!(s(libc::SYS_unshare, 0), errno(libc::EPERM));
+        assert_eq!(s(libc::SYS_clone3, 0), errno(libc::ENOSYS));
+        assert_eq!(
+            s(libc::SYS_clone, libc::CLONE_NEWUSER as u64),
+            errno(libc::EPERM)
+        );
+        assert_eq!(
+            s(libc::SYS_socket, libc::AF_VSOCK as u64),
+            errno(libc::EAFNOSUPPORT)
+        );
         for nr in [
             libc::SYS_read,
             libc::SYS_ioctl,
             libc::SYS_mmap,
             libc::SYS_setuid,
         ] {
-            assert_eq!(eval(&f, AUDIT_ARCH, nr as u32), RET_ALLOW);
+            assert_eq!(s(nr, 0), RET_ALLOW);
         }
-        assert_eq!(eval(&f, 0x4000_0003, 0), RET_KILL_PROCESS);
+        assert_eq!(s(libc::SYS_socket, libc::AF_UNIX as u64), RET_ALLOW);
     }
 }
