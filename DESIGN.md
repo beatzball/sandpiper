@@ -588,6 +588,9 @@ Code in a machine needs to call paid APIs. It must not receive the key.
 5. An intercepted request that carries a placeholder anywhere else — another
    header, the body, the URL, or a request to a different host — is
    **rejected** (not forwarded, nothing rewritten) and logged as a probe.
+   One exception: a dev box's own earlier placeholder, sent in the right
+   header, is refused and logged as stale (§11.5). Anywhere else it is still
+   a probe.
    Opaque traffic cannot be inspected, so probe detection covers intercepted
    traffic only.
 6. The proxy **does not follow redirects** on credentialed requests; the
@@ -767,13 +770,14 @@ machine is carried over.
 ```
 created ──start──► running ──stop──► stopped ──start──► running …
                       │                  │
-                      └──── max age ─────┴──► destroyed (snapshots deleted)
+                      ├──── max age ─────┴──► destroyed (snapshots deleted)
+                      └── host loss ──► failed ──DELETE──► destroyed
 ```
 
 - **Every routine host-made stop snapshots first:** idle TTL, the machine's
   max time, a host drain. Three cases skip the snapshot and fall back to the
   last good one: a crash (the disk may be half written), a failed wall check
-  and a policy violation (in both, the session is suspect). A snapshot that
+  and a policy violation (in the last two, the session is suspect). A snapshot that
   fails also falls back. Each case is an event.
 - **Host loss** marks the box `failed`, with an event. `start` is refused;
   `DELETE` cleans up.

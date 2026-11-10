@@ -88,7 +88,6 @@ allowed hosts are listed separately and are not closed.
 | Keep using a key after it is revoked | **Narrowed, not closed** | Revocations are pushed at once; cached secrets expire within 60 seconds (§8). | M3 |
 | Pin certificates to detect the proxy and refuse to work | **Kept inside** | Pinned clients fail closed. Nothing leaks (§8). | M2 |
 | Use a stolen project key to enter a dev box | **Narrowed, not closed** | Every route to a box, its machine or its snapshots needs the `devbox` scope; a key made for machines alone cannot reach them (§4.1, §11.5). A stolen key with that scope can. | M3.5 |
-| Attack the host's git through a repository fetched into a dev box | **Narrowed, not closed** | Only repositories on the project's list are fetched, by a jailed helper with network to one git host, caps, a fresh bare repository and no checkout (§11.5). A bug in git itself still lands in that jail. | M3.5 |
 | Steal a control-plane API key that a caller put into a machine | **Left to you** | Placeholders protect only grants (§8), not the platform's own API keys. Never pass an API key into a machine. Scopes limit what a stolen key can do (§4.1). | — |
 
 ## 4. Hiding what was done
@@ -106,6 +105,7 @@ allowed hosts are listed separately and are not closed.
 |---|---|---|---|
 | Plant a hook, filter or config in a repo that runs on the host when work is fetched | **Blocked** | Work leaves as a git bundle. The host fetches it in a jailed process into a fresh scratch repo, with `fsckObjects` on and one explicit refspec (§11.3). | M2 |
 | Send a hostile pack to exploit or exhaust the host's git | **Narrowed, not closed** | The fetch process is unprivileged, with no network, no host secrets, and CPU, memory, time and size caps (§11.3). A jail escape needs a further bug. | M2 |
+| Attack the host's git through a repository fetched into a dev box | **Narrowed, not closed** | Only repositories on the project's list are fetched, by a jailed helper with network to one git host, caps, a fresh bare repository and no checkout (§11.5). A bug in git itself still lands in that jail. | M3.5 |
 | Plant symlinks, submodules or `.gitattributes` filters that act on checkout | **Kept inside** | Fetched work is checked out or merged inside a machine, never in an operator checkout (§11.3). | M2 |
 | Put a backdoor, a changed CI config or an install script in the work itself | **Left to you** | The platform moves the work safely; it cannot judge it. Review before merge, and run CI for that branch in a machine, not on a trusted runner. | — |
 | Write instructions in exec output to steer the calling agent | **Left to you** | Exec output goes back to the caller's model (§11.1). Treat it as untrusted input. The caller's API key should carry no service or promotion scope (§4.1). | — |
