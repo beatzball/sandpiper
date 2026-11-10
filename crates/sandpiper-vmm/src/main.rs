@@ -1,8 +1,8 @@
 //! `sandpiper-vmm` — one microVM per process (DESIGN.md §4.2).
 //!
 //! ```text
-//! sandpiper-vmm boot (--root DIR | --disk IMAGE) --socket PATH [--cpus N] [--mem MIB]
-//!                    [--die-with-parent] [--jail DIR --uid N --gid N]
+//! sandpiper-vmm boot (--root DIR | --disk IMAGE) --relay-fd N [--cpus N] [--mem MIB]
+//!                    [--die-with-parent] (--socket PATH | --jail DIR --uid N --gid N)
 //! sandpiper-vmm run  (--root DIR | --disk IMAGE) [--cpus N] [--mem MIB] [--timeout SECS]
 //!                    [--stdin] [--time] -- CMD [ARGS...]
 //! ```
@@ -16,9 +16,13 @@
 //! skips the sandbox even as root. `run --probe` tests the sandbox's walls
 //! from inside instead of running a command.
 //!
-//! `boot` enters the VM and never returns. `run` is the M0 driver: it starts
-//! a `boot` child, connects to the guest agent, runs one command, prints its
-//! output, and destroys the machine. The host agent, `sandpiperd`, is the
+//! `boot` enters the VM and never returns. Its caller makes a listening Unix
+//! socket and passes it as descriptor `--relay-fd`; the VMM's relay (see
+//! `relay`) accepts the caller's connections there. `--socket` is where
+//! libkrun puts the guest agent's socket; a jailed VMM keeps it inside the
+//! jail. `run` is the M0 driver: it starts a `boot` child, talks to the
+//! guest agent through the relay, runs one command, prints its output, and
+//! destroys the machine. The host agent, `sandpiperd`, is the
 //! real driver; `run` stays for tests and development.
 //!
 //! `run` exits with the command's exit code (codes outside 0–255 become 255),
@@ -34,8 +38,9 @@ mod sandbox;
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::{Arc, Mutex};
@@ -68,6 +73,7 @@ struct Opts {
     uid: Option<u32>,
     gid: Option<u32>,
     socket: Option<String>,
+    relay_fd: Option<i32>,
     cpus: u8,
     mem: u32,
     timeout: Duration,
@@ -86,6 +92,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         uid: None,
         gid: None,
         socket: None,
+        relay_fd: None,
         cpus: 1,
         mem: 512,
         timeout: Duration::from_secs(30),
@@ -117,6 +124,13 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                 )
             }
             "--socket" => o.socket = Some(val("--socket")?),
+            "--relay-fd" => {
+                o.relay_fd = Some(
+                    val("--relay-fd")?
+                        .parse()
+                        .map_err(|_| "--relay-fd must be a number")?,
+                )
+            }
             "--cpus" => {
                 o.cpus = val("--cpus")?
                     .parse()
@@ -172,10 +186,10 @@ fn main() -> ExitCode {
 fn usage(err: &str) -> ExitCode {
     eprintln!("sandpiper-vmm: {err}");
     eprintln!(
-        "usage: sandpiper-vmm boot (--root DIR | --disk IMAGE) --socket PATH [--cpus N] [--mem MIB]"
+        "usage: sandpiper-vmm boot (--root DIR | --disk IMAGE) --relay-fd N [--cpus N] [--mem MIB]"
     );
     eprintln!(
-        "                          [--die-with-parent] [--jail DIR --uid N --gid N [--probe]]"
+        "                          [--die-with-parent] (--socket PATH | --jail DIR --uid N --gid N [--probe])"
     );
     eprintln!(
         "       sandpiper-vmm run (--root DIR | --disk IMAGE) [--timeout SECS] [--stdin] [--time] -- CMD [ARGS...]"
@@ -190,11 +204,21 @@ fn need<'a>(v: &'a Option<String>, name: &str) -> io::Result<&'a str> {
 }
 
 fn boot(o: &Opts) -> io::Result<std::convert::Infallible> {
-    let mut socket = need(&o.socket, "--socket")?.to_owned();
+    let listener = match o.relay_fd {
+        Some(fd) => Some(take_relay_listener(fd)?),
+        None if o.probe => None,
+        None => return Err(io::Error::other("--relay-fd is required")),
+    };
+    let mut socket = o.socket.clone();
     let mut disk = o.disk.clone();
     let run_as = match (&o.jail, o.uid, o.gid) {
         (None, None, None) => None,
         (Some(jail), Some(uid), Some(gid)) => {
+            if o.root.is_some() || o.socket.is_some() {
+                return Err(io::Error::other(
+                    "a sandboxed VMM takes --disk, and no --root or --socket",
+                ));
+            }
             if !o.die_with_parent && !o.probe {
                 return Err(io::Error::other(
                     "a sandboxed VMM needs --die-with-parent (its supervisor's lifeline)",
@@ -205,14 +229,16 @@ fn boot(o: &Opts) -> io::Result<std::convert::Infallible> {
                     "a sandboxed VMM's uid and gid must be at least {MIN_SANDBOX_ID}"
                 )));
             }
+            let image = need(&disk, "--disk")?;
             enter_jail(
                 Path::new(jail),
-                &mut socket,
-                &mut disk,
+                Path::new(image),
                 uid,
                 gid,
                 o.die_with_parent,
             )?;
+            socket = Some(JAILED_SOCKET.to_owned());
+            disk = Some(JAILED_DISK.to_owned());
             if o.probe {
                 probe_walls(uid, gid);
             }
@@ -247,15 +273,9 @@ fn boot(o: &Opts) -> io::Result<std::convert::Infallible> {
             unsafe { libc::_exit(EXIT_SANDPIPER.into()) };
         });
     }
+    let socket = need(&socket, "--socket")?.to_owned();
     // Guest frames are decoded here, inside the sandbox, never by the host.
-    let socket_dir = Path::new(&socket)
-        .parent()
-        .ok_or_else(|| io::Error::other("--socket needs a directory"))?;
-    relay::start(
-        socket_dir.to_path_buf(),
-        PathBuf::from(&socket),
-        run_as.map(|(uid, _)| uid),
-    );
+    relay::start(listener.expect("checked above"), PathBuf::from(&socket));
     let root = match (&o.root, &disk) {
         (Some(dir), None) => krun::Root::Dir(dir),
         (None, Some(image)) => krun::Root::Disk(image),
@@ -274,45 +294,70 @@ fn boot(o: &Opts) -> io::Result<std::convert::Infallible> {
     })
 }
 
-/// Enter the sandbox and rewrite the machine's paths to where they appear
-/// inside it. The socket and disk must both live in `<jail>/machine`.
 #[cfg(target_os = "linux")]
-fn enter_jail(
-    jail: &Path,
-    socket: &mut String,
-    disk: &mut Option<String>,
-    uid: u32,
-    gid: u32,
-    lifeline: bool,
-) -> io::Result<()> {
-    let machine = jail.join("machine");
-    let inside = |p: &str| -> io::Result<String> {
-        let rest = Path::new(p)
-            .strip_prefix(&machine)
-            .map_err(|_| io::Error::other(format!("{p} is not under {}", machine.display())))?;
-        Ok(Path::new(sandbox::MACHINE_DIR)
-            .join(rest)
-            .to_string_lossy()
-            .into_owned())
-    };
-    let new_socket = inside(socket)?;
-    let new_disk = disk.as_deref().map(inside).transpose()?;
-    let alive = sandbox::enter(jail, &machine, uid, gid, lifeline)?;
+use sandbox::{DISK as JAILED_DISK, GUEST_SOCKET as JAILED_SOCKET, RELAY_FD};
+#[cfg(not(target_os = "linux"))]
+const JAILED_DISK: &str = "/disk.img";
+#[cfg(not(target_os = "linux"))]
+const JAILED_SOCKET: &str = "/run/agent.sock";
+#[cfg(not(target_os = "linux"))]
+const RELAY_FD: libc::c_int = 4;
+
+/// Take the relay's listener from descriptor `fd`, moved to [`RELAY_FD`]
+/// (the one the jail keeps open) and closed on exec.
+fn take_relay_listener(fd: libc::c_int) -> io::Result<UnixListener> {
+    // SAFETY: fcntl and dup calls on descriptors this process owns; the
+    // listener takes ownership of RELAY_FD only once it holds the socket.
+    unsafe {
+        if libc::fcntl(fd, libc::F_GETFD) < 0 {
+            return Err(io::Error::other(format!("--relay-fd {fd} is not open")));
+        }
+        if fd != RELAY_FD {
+            if libc::dup2(fd, RELAY_FD) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            libc::close(fd);
+        }
+        libc::fcntl(RELAY_FD, libc::F_SETFD, libc::FD_CLOEXEC);
+        Ok(UnixListener::from_raw_fd(RELAY_FD))
+    }
+}
+
+/// Pass `listener` to a `boot` child as [`RELAY_FD`]. Call after any other
+/// `pre_exec` hook that uses a descriptor: this one may replace whatever
+/// held that number.
+fn pass_relay_listener(cmd: &mut Command, listener: &UnixListener) {
+    use std::os::unix::process::CommandExt;
+    let fd = listener.as_raw_fd();
+    // SAFETY: dup2 and fcntl only, which are safe between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            let rc = if fd == RELAY_FD {
+                libc::fcntl(fd, libc::F_SETFD, 0)
+            } else {
+                libc::dup2(fd, RELAY_FD)
+            };
+            if rc < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    cmd.args(["--relay-fd", &RELAY_FD.to_string()]);
+}
+
+/// Enter the sandbox. The disk and the guest's socket then live at
+/// [`JAILED_DISK`] and [`JAILED_SOCKET`].
+#[cfg(target_os = "linux")]
+fn enter_jail(jail: &Path, disk: &Path, uid: u32, gid: u32, lifeline: bool) -> io::Result<()> {
+    let alive = sandbox::enter(jail, disk, uid, gid, lifeline)?;
     thread::spawn(move || sandbox::exit_with_parent(alive));
-    *socket = new_socket;
-    *disk = new_disk;
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn enter_jail(
-    _: &Path,
-    _: &mut String,
-    _: &mut Option<String>,
-    _: u32,
-    _: u32,
-    _: bool,
-) -> io::Result<()> {
+fn enter_jail(_: &Path, _: &Path, _: u32, _: u32, _: bool) -> io::Result<()> {
     Err(io::Error::other("the VMM sandbox needs Linux"))
 }
 
@@ -372,19 +417,10 @@ fn copy_image(from: &Path, to: &Path) -> io::Result<()> {
     fs::copy(from, to).map(drop)
 }
 
-/// Give a machine directory and everything in it to the machine's uid.
-#[cfg(target_os = "linux")]
-fn chown_tree(dir: &Path, id: u32) -> io::Result<()> {
-    std::os::unix::fs::chown(dir, Some(id), Some(id))?;
-    for entry in fs::read_dir(dir)? {
-        std::os::unix::fs::chown(entry?.path(), Some(id), Some(id))?;
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn chown_tree(_: &Path, _: u32) -> io::Result<()> {
-    Ok(())
+/// Give the machine's disk image to its uid: the only host file the
+/// sandboxed VMM writes.
+fn chown_image(image: &Path, id: u32) -> io::Result<()> {
+    std::os::unix::fs::chown(image, Some(id), Some(id))
 }
 
 /// A private scratch directory for one machine's socket, removed on drop.
@@ -576,10 +612,10 @@ fn run(o: &Opts) -> io::Result<ExitCode> {
         // Set SANDPIPER_UNSANDBOXED=1 to say this is known and wanted.
         eprintln!("sandpiper-vmm: not root, so the VMM is NOT sandboxed (development only)");
     }
+    // Only root (or, unsandboxed, this user) can reach the scratch
+    // directory, so the relay's socket path cannot be swapped.
     let scratch = Scratch::new()?;
-    let machine = scratch.0.join("machine");
-    fs::DirBuilder::new().mode(0o700).create(&machine)?;
-    let socket = machine.join("agent.sock");
+    let relay_path = scratch.0.join("host.sock");
 
     let started = Instant::now();
     let mut boot = Command::new(std::env::current_exe()?);
@@ -590,7 +626,7 @@ fn run(o: &Opts) -> io::Result<ExitCode> {
         }
         (None, Some(image)) => {
             // Each machine writes to its own copy; the base image stays clean.
-            let copy = machine.join("root.img");
+            let copy = scratch.0.join("root.img");
             copy_image(Path::new(image), &copy)?;
             boot.arg("--disk").arg(copy);
         }
@@ -598,28 +634,31 @@ fn run(o: &Opts) -> io::Result<ExitCode> {
     }
     let machine_uid = sandboxed.then(|| RUN_ID_BASE + std::process::id());
     if let Some(id) = machine_uid {
-        chown_tree(&machine, id)?;
+        chown_image(&scratch.0.join("root.img"), id)?;
         boot.arg("--jail").arg(&scratch.0).args([
             "--uid",
             &id.to_string(),
             "--gid",
             &id.to_string(),
         ]);
+    } else {
+        boot.arg("--socket").arg(scratch.0.join("agent.sock"));
     }
     if o.probe {
-        let status = boot.arg("--socket").arg(&socket).arg("--probe").status()?;
+        let status = boot.arg("--probe").status()?;
         return Ok(ExitCode::from(status.code().unwrap_or(125) as u8));
     }
+    let listener = UnixListener::bind(&relay_path)?;
+    pass_relay_listener(&mut boot, &listener);
     let (lifeline_r, lifeline_w) = io::pipe()?;
     let mut child = boot
-        .arg("--socket")
-        .arg(&socket)
         .args(["--cpus", &o.cpus.to_string(), "--mem", &o.mem.to_string()])
         .arg("--die-with-parent")
         .stdin(lifeline_r)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    drop(listener);
     let console = ConsoleTail::default();
     let captures = [
         console.capture(child.stdout.take().expect("piped")),
@@ -628,7 +667,7 @@ fn run(o: &Opts) -> io::Result<ExitCode> {
     let machine = Machine(Arc::new(Mutex::new(child)));
     let watchdog = Watchdog::start(Arc::clone(&machine.0), started + BOOT_TIMEOUT);
 
-    let outcome = exchange(o, &socket, machine_uid, &machine, &watchdog, started);
+    let outcome = exchange(o, &relay_path, &machine, &watchdog, started);
     watchdog.stop();
     // Destroy the machine, then let the console readers drain to EOF so a
     // report shows the VMM's last words.
@@ -680,14 +719,12 @@ fn run(o: &Opts) -> io::Result<ExitCode> {
 /// checked every frame the guest sent.
 fn exchange(
     o: &Opts,
-    socket: &Path,
-    peer_uid: Option<u32>,
+    relay: &Path,
     machine: &Machine,
     watchdog: &Watchdog,
     started: Instant,
 ) -> io::Result<Outcome> {
-    let relay = socket.with_file_name(relay::HOST_SOCKET);
-    let mut conn = match connect(&relay, peer_uid, machine, watchdog)? {
+    let mut conn = match connect(relay, machine, watchdog)? {
         Some(conn) => conn,
         None => return Ok(Outcome::TimedOut),
     };
@@ -698,8 +735,7 @@ fn exchange(
         &mut conn,
         &Frame::Exec(ExecRequest {
             argv: o.argv.clone(),
-            env: Vec::new(),
-            cwd: None,
+            ..Default::default()
         }),
     )?;
 
@@ -789,7 +825,6 @@ impl<W: Write> CappedSink<W> {
 /// the wait. Returns `None` if the watchdog fired during boot.
 fn connect(
     socket: &Path,
-    peer_uid: Option<u32>,
     machine: &Machine,
     watchdog: &Watchdog,
 ) -> io::Result<Option<UnixStream>> {
@@ -818,74 +853,30 @@ fn connect(
             )));
         }
         match UnixStream::connect(socket) {
-            Ok(mut conn) => {
-                // The machine's directory belongs to its uid, so the path
-                // could have been swapped for a link to another socket.
-                // Speak only to the machine's own VMM.
-                if let Some(want) = peer_uid {
-                    let got = peer_uid_of(&conn)?;
-                    if got != want {
-                        return Err(io::Error::other(format!(
-                            "socket peer is uid {got}, not the machine's uid {want}; refusing"
-                        )));
-                    }
+            Ok(mut conn) => match read_frame(&mut conn) {
+                Ok(Some(Frame::Ready { version })) if version == PROTOCOL_VERSION => {
+                    return Ok(Some(conn));
                 }
-                match read_frame(&mut conn) {
-                    Ok(Some(Frame::Ready { version })) if version == PROTOCOL_VERSION => {
-                        return Ok(Some(conn));
-                    }
-                    Ok(Some(Frame::Ready { version })) => {
-                        return Err(io::Error::other(format!(
-                            "guest speaks protocol {version}, host {PROTOCOL_VERSION}"
-                        )));
-                    }
-                    Ok(Some(other)) => {
-                        return Err(io::Error::other(format!(
-                            "expected Ready, got {} frame",
-                            other.kind()
-                        )));
-                    }
-                    Ok(None) | Err(_) if watchdog.fired() => return Ok(None),
-                    Ok(None) => return Err(io::Error::other("relay closed before Ready")),
-                    Err(e) => return Err(e),
+                Ok(Some(Frame::Ready { version })) => {
+                    return Err(io::Error::other(format!(
+                        "guest speaks protocol {version}, host {PROTOCOL_VERSION}"
+                    )));
                 }
-            }
+                Ok(Some(other)) => {
+                    return Err(io::Error::other(format!(
+                        "expected Ready, got {} frame",
+                        other.kind()
+                    )));
+                }
+                Ok(None) | Err(_) if watchdog.fired() => return Ok(None),
+                Ok(None) => return Err(io::Error::other("relay closed before Ready")),
+                Err(e) => return Err(e),
+            },
             Err(e) if retryable(&e) => {}
             Err(e) => return Err(e),
         }
         thread::sleep(Duration::from_millis(5));
     }
-}
-
-#[cfg(target_os = "linux")]
-fn peer_uid_of(conn: &UnixStream) -> io::Result<u32> {
-    let mut cred = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: getsockopt into a correctly sized ucred.
-    let rc = unsafe {
-        libc::getsockopt(
-            std::os::fd::AsRawFd::as_raw_fd(conn),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut cred as *mut libc::ucred).cast(),
-            &mut len,
-        )
-    };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(cred.uid)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn peer_uid_of(_: &UnixStream) -> io::Result<u32> {
-    Err(io::Error::other(
-        "peer credentials are checked on Linux only",
-    ))
 }
 
 /// Cut guest-supplied text to `max` bytes and escape control characters, so

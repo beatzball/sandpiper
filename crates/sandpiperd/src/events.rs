@@ -259,7 +259,14 @@ pub fn follow(
                 let (log, machine) = (Arc::clone(&log), machine.clone());
                 tokio::task::spawn_blocking(move || log.read(&machine, next, PAGE)).await
             };
-            let Ok(Ok(page)) = page else { return };
+            let page = match page {
+                Ok(Ok(page)) => page,
+                Ok(Err(e)) => {
+                    let _ = tx.send(Ok(stream_error(&e.to_string()))).await;
+                    return;
+                }
+                Err(_) => return,
+            };
             let full = page.len() == PAGE;
             for e in &page {
                 next = e.seq + 1;
@@ -269,6 +276,17 @@ pub fn follow(
             }
             if full {
                 continue;
+            }
+            // Asked to start past the machine's end: nothing more will come.
+            if page.is_empty() {
+                let (log, m) = (Arc::clone(&log), machine.clone());
+                let ended =
+                    tokio::task::spawn_blocking(move || log.last_of(&m, "machine.destroyed")).await;
+                if let Ok(Ok(Some(e))) = ended
+                    && e.seq < next
+                {
+                    return;
+                }
             }
             loop {
                 let e = tokio::select! {
@@ -291,6 +309,15 @@ pub fn follow(
         }
     });
     rx
+}
+
+/// A last line that tells the client the stream broke, not ended.
+fn stream_error(message: &str) -> Bytes {
+    let mut v =
+        serde_json::to_vec(&serde_json::json!({"type": "stream.error", "message": message}))
+            .expect("serializes");
+    v.push(b'\n');
+    Bytes::from(v)
 }
 
 /// Send one event if `keep` passes it. Returns true when the stream is
@@ -381,6 +408,11 @@ mod tests {
             seqs.push(v["seq"].as_u64().unwrap());
         }
         assert_eq!(seqs, (5..=2301).collect::<Vec<_>>());
+
+        // Past the end of a finished machine: the stream ends at once.
+        let mut rx = follow(Arc::clone(&log), "a".into(), 9999, |_| true, |_| false);
+        let ended = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        assert!(matches!(ended, Ok(None)));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

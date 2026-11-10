@@ -8,8 +8,9 @@
 //!
 //! 1. [`enter`]: new namespaces and a fork. The child becomes PID 1 of the
 //!    new PID namespace and goes on; the parent becomes its **supervisor**
-//!    (see [`supervise`]). The child closes every inherited descriptor and
-//!    moves into a minimal root built on a tmpfs with `pivot_root`.
+//!    (see [`supervise`]). The child closes every inherited descriptor but
+//!    the relay's listener and moves into a minimal root built on a tmpfs
+//!    with `pivot_root`. Of the host's files it sees only its disk image.
 //! 2. libkrun is configured; it records the disk and socket paths.
 //! 3. [`limit_resources`], [`drop_groups`] and [`install_filter`] run in
 //!    `before_enter`.
@@ -26,8 +27,15 @@ use std::path::Path;
 
 use sandpiper_seccomp::{Filter, errno};
 
-/// Where the machine's directory appears inside the sandbox.
-pub const MACHINE_DIR: &str = "/machine";
+/// Where the machine's disk image appears inside the sandbox.
+pub const DISK: &str = "/disk.img";
+
+/// Where libkrun puts the guest agent's socket inside the sandbox: a small
+/// tmpfs of its own, so nothing the VMM writes lands on the host's disks.
+pub const GUEST_SOCKET: &str = "/run/agent.sock";
+
+/// The descriptor of the relay's listening socket, kept across the jail.
+pub const RELAY_FD: libc::c_int = 4;
 
 /// The lowest uid or gid a sandboxed VMM may run as.
 pub const MIN_ID: u32 = 100_000;
@@ -76,9 +84,10 @@ fn mount(
     .map_err(|e| io::Error::other(format!("mount {}: {e}", dst.display())))
 }
 
-/// Enter the sandbox. `machine` is the host directory holding this machine's
-/// disk image and socket; inside, it is the only host directory visible, at
-/// [`MACHINE_DIR`]. Returns in the sandboxed child; the parent never returns.
+/// Enter the sandbox. `disk` is the machine's disk image; inside, it is the
+/// only host file visible, at [`DISK`]. The caller must hold the relay's
+/// listener at [`RELAY_FD`]. Returns in the sandboxed child; the parent
+/// never returns.
 ///
 /// With `lifeline`, stdin is a pipe from the driver: when it closes, the
 /// supervisor kills the machine.
@@ -88,7 +97,7 @@ fn mount(
 /// does not depend on the VMM's cooperation.
 pub fn enter(
     scratch: &Path,
-    machine: &Path,
+    disk: &Path,
     uid: u32,
     gid: u32,
     lifeline: bool,
@@ -149,12 +158,14 @@ pub fn enter(
         }
         // Nothing the caller left open may follow the VMM into the jail: an
         // inherited directory descriptor would reach around pivot_root.
-        // Keep stdio and the pipe, at a known number, and close the rest.
+        // Keep stdio, the pipe at a known number, and the relay's listener
+        // (which the pipe cannot have taken: RELAY_FD was already open), and
+        // close the rest.
         if alive[0] != ALIVE_FD {
             os(libc::dup3(alive[0], ALIVE_FD, libc::O_CLOEXEC))?;
             libc::close(alive[0]);
         }
-        os(libc::syscall(libc::SYS_close_range, ALIVE_FD + 1, libc::c_uint::MAX, 0) as libc::c_int)
+        os(libc::syscall(libc::SYS_close_range, RELAY_FD + 1, libc::c_uint::MAX, 0) as libc::c_int)
             .map_err(|e| io::Error::other(format!("close_range: {e}")))?;
     }
     // SAFETY: ALIVE_FD is open and owned by nothing else from here on.
@@ -199,15 +210,28 @@ pub fn enter(
         ))?;
         os(libc::chown(kvm_node.as_ptr(), uid, gid))?;
     }
-    let inside = new_root.join(MACHINE_DIR.trim_start_matches('/'));
-    fs::create_dir(&inside)?;
-    mount(Some(machine), &inside, None, libc::MS_BIND, None)?;
+    // The disk image alone, not its directory: the VMM can write into the
+    // image (bounded by RLIMIT_FSIZE) but cannot make files on the host.
+    let inside = new_root.join(DISK.trim_start_matches('/'));
+    fs::File::create(&inside)?;
+    mount(Some(disk), &inside, None, libc::MS_BIND, None)?;
     mount(
         None,
         &inside,
         None,
         libc::MS_REMOUNT | libc::MS_BIND | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
         None,
+    )?;
+    let run = new_root.join("run");
+    fs::create_dir(&run)?;
+    mount(
+        Some(Path::new("tmpfs")),
+        &run,
+        Some("tmpfs"),
+        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+        Some(&format!(
+            "size=64k,nr_inodes=16,mode=0700,uid={uid},gid={gid}"
+        )),
     )?;
 
     // SAFETY: path arguments are valid C strings; pivot_root has no libc

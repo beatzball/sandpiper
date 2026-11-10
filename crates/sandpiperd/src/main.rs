@@ -19,6 +19,7 @@ mod ids;
 mod machines;
 
 use std::fs;
+use std::future::IntoFuture;
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -154,12 +155,29 @@ fn run(o: Opts) -> io::Result<()> {
             listener.local_addr()?,
             state.join("token").display()
         );
-        axum::serve(listener, api::router(app))
-            .with_graceful_shutdown(shutdown_signal())
+        let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(
+            axum::serve(listener, api::router(app))
+                .with_graceful_shutdown(async {
+                    let _ = drain_rx.await;
+                })
+                .into_future(),
+        );
+        shutdown_signal().await;
+        // Machines first: their `machine.destroyed` events end the event
+        // streams still open, so the server can then drain.
+        eprintln!("sandpiperd: stopping; destroying every machine");
+        let m = Arc::clone(&mgr);
+        let _ = tokio::task::spawn_blocking(move || m.destroy_all("host agent stopping")).await;
+        let _ = drain_tx.send(());
+        if tokio::time::timeout(Duration::from_secs(5), server)
             .await
+            .is_err()
+        {
+            eprintln!("sandpiperd: some connections did not close; stopping anyway");
+        }
+        io::Result::Ok(())
     })?;
-    eprintln!("sandpiperd: stopping; destroying every machine");
-    mgr.destroy_all("host agent stopping");
     Ok(())
 }
 
@@ -176,6 +194,17 @@ async fn shutdown_signal() {
 /// Read the API token, or make one: 32 random bytes as hex, readable by
 /// the owner only.
 fn load_token(path: &Path) -> io::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    match fs::metadata(path) {
+        // SAFETY: geteuid has no preconditions.
+        Ok(m) if m.mode() & 0o077 != 0 || m.uid() != unsafe { libc::geteuid() } => {
+            return Err(io::Error::other(format!(
+                "{} must belong to this user and be readable by no one else (chmod 600)",
+                path.display()
+            )));
+        }
+        _ => {}
+    }
     match fs::read_to_string(path) {
         Ok(t) if t.trim().len() >= 32 => return Ok(t.trim().to_owned()),
         Ok(_) => {

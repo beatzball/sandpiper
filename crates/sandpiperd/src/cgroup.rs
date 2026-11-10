@@ -34,8 +34,9 @@ pub struct Limits {
 
 pub struct Root {
     base: PathBuf,
-    /// The whole disk that holds machine images, as `major:minor`.
-    disk: String,
+    /// The whole disk that holds machine images, as `major:minor`, if it
+    /// has one.
+    disk: Option<String>,
 }
 
 fn write(path: &Path, value: &str) -> io::Result<()> {
@@ -78,10 +79,14 @@ impl Root {
             base
         };
         write(&base.join("cgroup.subtree_control"), CONTROLLERS)?;
-        Ok(Self {
-            disk: whole_disk(state)?,
-            base,
-        })
+        let disk = match whole_disk(state) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!("sandpiperd: machines get no disk I/O limit: {e}");
+                None
+            }
+        };
+        Ok(Self { disk, base })
     }
 
     /// Kill and remove machine cgroups a previous run left behind.
@@ -120,14 +125,12 @@ impl Root {
                 format!("{} 100000", u32::from(limits.cpus) * 100_000),
             )
         })
-        .and_then(|()| {
-            set(
+        .and_then(|()| match &self.disk {
+            Some(disk) => set(
                 "io.max",
-                format!(
-                    "{} rbps={IO_BPS} wbps={IO_BPS} riops={IO_IOPS} wiops={IO_IOPS}",
-                    self.disk
-                ),
-            )
+                format!("{disk} rbps={IO_BPS} wbps={IO_BPS} riops={IO_IOPS} wiops={IO_IOPS}"),
+            ),
+            None => Ok(()),
         });
         if let Err(e) = applied {
             let _ = g.remove();
@@ -137,6 +140,7 @@ impl Root {
     }
 }
 
+#[derive(Clone)]
 pub struct Group {
     path: PathBuf,
 }

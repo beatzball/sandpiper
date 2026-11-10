@@ -26,7 +26,7 @@ start() {
   TOKEN=$(sudo cat "$STATE/token")
 }
 stop() { sudo kill -"${1:-TERM}" "$(pgrep -P "$daemon" -x sandpiperd || echo "$daemon")" 2>/dev/null; wait "$daemon" 2>/dev/null; }
-cleanup() { [ -n "$daemon" ] && stop; sudo rm -rf "$STATE" "$STATE.log"; }
+cleanup() { [ -n "$daemon" ] && stop; sudo rm -rf "$STATE" "$STATE.log" "$STATE.big" "$STATE.stream"; }
 trap cleanup EXIT
 
 # api METHOD PATH [JSON] — prints the body, then the status on its own line.
@@ -77,6 +77,11 @@ check "files persist between execs" "kept|0" \
   "$(run_in "$M" '{"cmd":["sh","-c","echo kept > /tmp/f"]}' >/dev/null; run_in "$M" '{"cmd":["cat","/tmp/f"]}')"
 check "exec timeout"            "|exec.timedout" "$(run_in "$M" '{"cmd":["sleep","30"],"timeoutMs":1000}')"
 check "machine runs on after a timeout" "still|0" "$(run_in "$M" '{"cmd":["echo","still"]}')"
+# A command that never reads its stdin, with more input than any buffer
+# holds: the timeout must still stop it.
+python3 -c 'import base64,json; print(json.dumps({"cmd":["sleep","30"],"timeoutMs":1500,"stdinBase64":base64.b64encode(bytes(4<<20)).decode()}))' >"$STATE.big"
+check "timeout with unread stdin" "|exec.timedout" "$(run_in "$M" "@$STATE.big")"
+check "  ...and the next exec runs" "next|0" "$(run_in "$M" '{"cmd":["echo","next"]}')"
 api POST "/v1/machines/$M/exec" '{"cmd":["sleep","3"]}' >/dev/null &
 long=$!
 sleep 1
@@ -96,12 +101,22 @@ replay=$(curl -s --max-time 2 -H "Authorization: Bearer $TOKEN" "$URL/v1/events?
 check "events replay from 1"    "machine.created" "$(echo "$replay" | head -1 | field '["type"]')"
 check "events replay from n"    "3" "$(curl -s --max-time 2 -H "Authorization: Bearer $TOKEN" "$URL/v1/events?machine=$M&from=3" | head -1 | field '["seq"]')"
 
+api POST "/v1/machines/$M/exec" '{"cmd":["sleep","30"]}' >"$STATE.stream" &
+long=$!
+sleep 1
 check "destroy"                 "204" "$(api DELETE "/v1/machines/$M" | status)"
+wait "$long"
+check "an exec in flight ends with the machine" "exec.failed machine stopped" \
+  "$(head -n -1 "$STATE.stream" | grep -v '^$' | tail -1 | python3 -c 'import json,sys; e=json.load(sys.stdin); print(e["type"], e["reason"])')"
+check "  ...and its end comes before the machine's" "exec.failed machine.destroyed" \
+  "$(curl -s --max-time 5 -H "Authorization: Bearer $TOKEN" "$URL/v1/events?machine=$M" | tail -2 | python3 -c 'import json,sys; print(" ".join(json.loads(l)["type"] for l in sys.stdin))')"
 check "destroyed machine state" "destroyed" "$(api GET "/v1/machines/$M" | field '["state"]')"
 check "cgroup removed"          "0" "$([ -d "$cg" ] && echo 1 || echo 0)"
 check "no VMM left"             "" "$(pgrep -f 'sandpiper-vmm boot')"
 check "events end at destroyed" "machine.destroyed" \
   "$(curl -s --max-time 5 -H "Authorization: Bearer $TOKEN" "$URL/v1/events?machine=$M" | tail -1 | field '["type"]')"
+check "replay past the end returns at once" "0" \
+  "$(curl -s -o /dev/null -w '%{exitcode}' --max-time 3 -H "Authorization: Bearer $TOKEN" "$URL/v1/events?machine=$M&from=99999")"
 
 # The final stop needs nothing from the VMM side: freeze the supervisor and
 # the machine still goes.
@@ -127,7 +142,13 @@ start
 check "restart marks lost machines failed" "failed" "$(api GET "/v1/machines/$M" | field '["state"]')"
 
 M=$(create | field '["id"]')
+curl -s -H "Authorization: Bearer $TOKEN" "$URL/v1/events?machine=$M" >/dev/null &
+follower=$!
+sleep 0.5
+began=$(date +%s)
 stop TERM
+check "a clean stop does not wait for open streams" "1" "$([ $(( $(date +%s) - began )) -lt 10 ] && echo 1 || echo 0)"
+wait "$follower"
 start
 check "clean stop destroys machines" "host agent stopping" "$(api GET "/v1/machines/$M" | field '["reason"]')"
 

@@ -5,15 +5,20 @@
 //! Each machine is one `sandpiper-vmm boot` process. On a Linux host it is
 //! sandboxed: its own uid from [`UID_BASE`], a jail, its own cgroup. The
 //! host agent never reads the guest's raw frames: it talks to the relay in
-//! the VMM process (see `sandpiper-vmm`'s `relay`), and checks that the
-//! relay's socket belongs to the machine's uid.
+//! the VMM process (see `sandpiper-vmm`'s `relay`) over a socket the host
+//! agent made, in a directory only root can reach.
+//!
+//! What a machine sends is still untrusted here: a VMM taken over could
+//! send anything the frame format allows. So the host keeps its own limits
+//! on each exec's output and on all a machine may write to the event log.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Read};
 use std::net::Shutdown;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,7 +28,9 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use sandpiper_proto::{ExecRequest, Frame, PROTOCOL_VERSION, read_frame, write_frame};
+use sandpiper_proto::{
+    DEFAULT_OUTPUT_CAP, ExecRequest, Frame, PROTOCOL_VERSION, read_frame, write_frame,
+};
 use serde_json::json;
 
 use crate::events::{Log, now_ms};
@@ -37,8 +44,24 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a machine gets to stop after its lifeline closes, before
 /// `cgroup.kill`.
 const STOP_GRACE: Duration = Duration::from_secs(2);
+/// How long past an exec's timeout the host waits for the guest to stop it.
+const HOST_TIMEOUT_GRACE: Duration = Duration::from_secs(2);
+/// How long a destroy waits for an exec in flight to record its end.
+const EXEC_SETTLE: Duration = Duration::from_secs(5);
 const CONSOLE_TAIL: usize = 16 * 1024;
 const STDIN_CHUNK: usize = 32 * 1024;
+/// Output is written to the log in pieces of at most this size, or after
+/// [`FLUSH_EVERY`], whichever comes first.
+const OUTPUT_PIECE: usize = 64 * 1024;
+const FLUSH_EVERY: Duration = Duration::from_millis(100);
+/// Most `Error` frames one exec may send.
+const MAX_ERRORS: usize = 16;
+/// Most bytes of guest data one machine may put into the event log.
+const MACHINE_LOG_QUOTA: u64 = 64 << 20;
+/// Most bytes of command, environment and working directory in one exec.
+pub const MAX_REQUEST: usize = 256 << 10;
+/// The descriptor a `boot` child receives the relay's listener on.
+const RELAY_FD: i32 = 4;
 
 #[derive(Clone)]
 pub struct Config {
@@ -80,6 +103,7 @@ type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
+    Starting,
     Running,
     Stopping,
 }
@@ -87,6 +111,7 @@ enum State {
 struct Machine {
     id: String,
     template: String,
+    slot: u32,
     uid: Option<u32>,
     dir: PathBuf,
     created: Instant,
@@ -96,24 +121,30 @@ struct Machine {
     child: Mutex<Child>,
     /// Closing it tells the VMM's supervisor to kill the machine.
     lifeline: Mutex<Option<io::PipeWriter>>,
-    #[cfg(target_os = "linux")]
-    cgroup: Option<crate::cgroup::Group>,
+    cgroup: Option<CgroupGroup>,
     state: Mutex<State>,
     /// Why the machine is stopping, once it is.
     reason: Mutex<Option<String>>,
     last_active: Mutex<Instant>,
     busy: AtomicBool,
     execs: AtomicU64,
+    /// Bytes of guest data this machine has put into the event log.
+    logged: AtomicU64,
     console: Arc<Mutex<VecDeque<u8>>>,
 }
 
 impl Machine {
     fn relay(&self) -> PathBuf {
-        self.dir.join("machine").join("host.sock")
+        self.dir.join("host.sock")
+    }
+
+    fn state(&self) -> State {
+        *self.state.lock().expect("state lock")
     }
 
     fn info(&self) -> serde_json::Value {
-        let state = match *self.state.lock().expect("state lock") {
+        let state = match self.state() {
+            State::Starting => "starting",
             State::Running => "running",
             State::Stopping => "stopping",
         };
@@ -133,16 +164,23 @@ impl Machine {
         let bytes: Vec<u8> = t.iter().copied().collect();
         crate::sanitize(&String::from_utf8_lossy(&bytes), CONSOLE_TAIL)
     }
+
+    /// Count `n` bytes against the machine's log quota; false once over.
+    fn charge(&self, n: usize) -> bool {
+        self.logged.fetch_add(n as u64, Ordering::SeqCst) + n as u64 <= MACHINE_LOG_QUOTA
+    }
 }
 
 /// Spawns VMM processes from one thread that never exits. A sandboxed
 /// VMM's supervisor dies with the *thread* that spawned it
 /// (`PR_SET_PDEATHSIG`), so short-lived worker threads cannot do it.
-struct Spawner(Mutex<mpsc::Sender<(Command, mpsc::Sender<io::Result<Child>>)>>);
+type SpawnJob = (Command, mpsc::Sender<io::Result<Child>>);
+
+struct Spawner(Mutex<mpsc::Sender<SpawnJob>>);
 
 impl Spawner {
     fn start() -> Self {
-        let (tx, rx) = mpsc::channel::<(Command, mpsc::Sender<io::Result<Child>>)>();
+        let (tx, rx) = mpsc::channel::<SpawnJob>();
         thread::Builder::new()
             .name("vmm-spawner".into())
             .spawn(move || {
@@ -170,7 +208,11 @@ pub struct Manager {
     cfg: Config,
     log: Arc<Log>,
     machines: Mutex<HashMap<String, Arc<Machine>>>,
-    uids: Mutex<BTreeSet<u32>>,
+    /// Slots in use, by live machines and by quarantined uids.
+    slots: Mutex<BTreeSet<u32>>,
+    /// Machines whose cgroup could not be emptied: their uid is not handed
+    /// out again until it is.
+    quarantine: Mutex<Vec<(u32, CgroupGroup)>>,
     spawner: Spawner,
     #[cfg(target_os = "linux")]
     cgroups: Option<crate::cgroup::Root>,
@@ -190,6 +232,19 @@ pub struct ExecArgs {
     pub cwd: Option<String>,
     pub stdin: Vec<u8>,
     pub timeout: Option<Duration>,
+}
+
+impl ExecArgs {
+    /// Bytes of command, environment and working directory.
+    pub fn request_size(&self) -> usize {
+        self.cmd.iter().map(String::len).sum::<usize>()
+            + self
+                .env
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>()
+            + self.cwd.as_ref().map_or(0, String::len)
+    }
 }
 
 impl Manager {
@@ -230,7 +285,8 @@ impl Manager {
             cfg,
             log,
             machines: Mutex::new(HashMap::new()),
-            uids: Mutex::new(BTreeSet::new()),
+            slots: Mutex::new(BTreeSet::new()),
+            quarantine: Mutex::new(Vec::new()),
             spawner: Spawner::start(),
             #[cfg(target_os = "linux")]
             cgroups,
@@ -263,35 +319,32 @@ impl Manager {
                 ),
             ));
         }
+        let slot = self.alloc_slot()?;
+        let uid = self.cfg.sandbox.then_some(UID_BASE + slot);
         let id = ids::new_id("m");
-        let uid = if self.cfg.sandbox {
-            Some(self.alloc_uid()?)
-        } else {
-            if self.machines.lock().expect("machines lock").len() >= self.cfg.max_machines {
-                return Err(Error::new(503, "this host is full"));
-            }
-            None
-        };
-        self.log.append(
+        if let Err(e) = self.log.append(
             &id,
             "machine.created",
             json!({"template": req.template, "metadata": req.metadata}),
-        )?;
+        ) {
+            self.free_slot(slot);
+            return Err(e.into());
+        }
         let started = Instant::now();
         let dir = self.cfg.state.join("machines").join(&id);
-        let launched = self.launch(&id, &dir, &image, uid);
-        let (child, lifeline, console, cgroup) = match launched {
+        let (child, lifeline, console, cgroup) = match self.launch(&id, &dir, &image, uid) {
             Ok(parts) => parts,
             Err(e) => {
                 let _ = fs::remove_dir_all(&dir);
-                self.free_uid(uid);
-                self.finish(&id, Some(&e.to_string()), "failed to start")?;
+                self.free_slot(slot);
+                let _ = self.finish(&id, Some(&e.to_string()), "failed to start");
                 return Err(Error::new(500, format!("machine failed to start: {e}")));
             }
         };
         let machine = Arc::new(Machine {
             id: id.clone(),
             template: req.template,
+            slot,
             uid,
             dir,
             created: started,
@@ -300,38 +353,43 @@ impl Manager {
             max,
             child: Mutex::new(child),
             lifeline: Mutex::new(Some(lifeline)),
-            #[cfg(target_os = "linux")]
             cgroup,
-            state: Mutex::new(State::Running),
+            state: Mutex::new(State::Starting),
             reason: Mutex::new(None),
             last_active: Mutex::new(Instant::now()),
-            busy: AtomicBool::new(true), // until it is ready
+            busy: AtomicBool::new(false),
             execs: AtomicU64::new(0),
+            logged: AtomicU64::new(0),
             console,
         });
-        #[cfg(not(target_os = "linux"))]
-        let _ = cgroup;
         self.machines
             .lock()
             .expect("machines lock")
             .insert(id.clone(), Arc::clone(&machine));
-        match self.wait_ready(&machine) {
-            Ok(()) => {
-                *machine.last_active.lock().expect("lock") = Instant::now();
-                machine.busy.store(false, Ordering::SeqCst);
-                self.log.append(
-                    &id,
-                    "machine.running",
-                    json!({"readyMs": started.elapsed().as_millis() as u64}),
-                )?;
-                Ok(machine.info())
-            }
-            Err(e) => {
-                let reason = format!("machine failed to start: {e}");
-                self.destroy_machine(&machine, &reason, true);
-                Err(Error::new(500, reason))
-            }
+        if let Err(e) = self.wait_ready(&machine) {
+            let reason = format!("machine failed to start: {e}");
+            self.destroy_machine(&machine, &reason, true);
+            return Err(Error::new(500, reason));
         }
+        // Under the state lock, so a destroy cannot slip its events between
+        // the check and the record.
+        let mut state = machine.state.lock().expect("state lock");
+        if *state != State::Starting {
+            return Err(Error::new(409, "machine was destroyed while it started"));
+        }
+        let ready_ms = started.elapsed().as_millis() as u64;
+        if let Err(e) = self
+            .log
+            .append(&id, "machine.running", json!({"readyMs": ready_ms}))
+        {
+            drop(state);
+            self.destroy_machine(&machine, &format!("event log failed: {e}"), true);
+            return Err(e.into());
+        }
+        *state = State::Running;
+        drop(state);
+        *machine.last_active.lock().expect("lock") = Instant::now();
+        Ok(machine.info())
     }
 
     fn template_image(&self, name: &str) -> Result<PathBuf> {
@@ -348,22 +406,22 @@ impl Manager {
         Ok(path)
     }
 
-    fn alloc_uid(&self) -> Result<u32> {
-        let mut uids = self.uids.lock().expect("uids lock");
-        if uids.len() >= self.cfg.max_machines {
+    /// Reserve a machine slot, which also fixes its uid.
+    fn alloc_slot(&self) -> Result<u32> {
+        let live = self.machines.lock().expect("machines lock").len();
+        let mut slots = self.slots.lock().expect("slots lock");
+        if live >= self.cfg.max_machines || slots.len() >= self.cfg.max_machines * 2 {
             return Err(Error::new(503, "this host is full"));
         }
         let slot = (0..u32::MAX)
-            .find(|s| !uids.contains(&(UID_BASE + s)))
-            .expect("fewer machines than uids");
-        uids.insert(UID_BASE + slot);
-        Ok(UID_BASE + slot)
+            .find(|s| !slots.contains(s))
+            .expect("fewer machines than slots");
+        slots.insert(slot);
+        Ok(slot)
     }
 
-    fn free_uid(&self, uid: Option<u32>) {
-        if let Some(uid) = uid {
-            self.uids.lock().expect("uids lock").remove(&uid);
-        }
+    fn free_slot(&self, slot: u32) {
+        self.slots.lock().expect("slots lock").remove(&slot);
     }
 
     #[allow(clippy::type_complexity)]
@@ -379,24 +437,23 @@ impl Manager {
         Arc<Mutex<VecDeque<u8>>>,
         Option<CgroupGroup>,
     )> {
-        let machine = dir.join("machine");
+        // Only root can reach the machine's directory. The VMM sees just
+        // its disk image, which is the one file its uid owns.
         fs::DirBuilder::new().mode(0o700).create(dir)?;
-        fs::DirBuilder::new().mode(0o700).create(&machine)?;
-        let disk = machine.join("root.img");
+        let disk = dir.join("root.img");
         copy_image(image, &disk)?;
+        let listener = UnixListener::bind(dir.join("host.sock"))?;
 
         let mut cmd = Command::new(&self.cfg.vmm);
         cmd.arg("boot")
             .arg("--disk")
             .arg(&disk)
-            .arg("--socket")
-            .arg(machine.join("agent.sock"))
             .args(["--cpus", &self.cfg.cpus.to_string()])
             .args(["--mem", &self.cfg.mem_mib.to_string()])
             .arg("--die-with-parent");
         let cgroup = match uid {
             Some(uid) => {
-                chown_tree(&machine, uid)?;
+                std::os::unix::fs::chown(&disk, Some(uid), Some(uid))?;
                 cmd.arg("--jail").arg(dir).args([
                     "--uid",
                     &uid.to_string(),
@@ -406,10 +463,16 @@ impl Manager {
                 self.make_cgroup(id, &mut cmd)?
             }
             None => {
-                cmd.env("SANDPIPER_UNSANDBOXED", "1");
+                cmd.arg("--socket")
+                    .arg(dir.join("agent.sock"))
+                    .env("SANDPIPER_UNSANDBOXED", "1");
                 None
             }
         };
+        // After the cgroup hook, which uses a descriptor this one may
+        // replace.
+        pass_fd(&mut cmd, listener.as_raw_fd(), RELAY_FD);
+        cmd.args(["--relay-fd", &RELAY_FD.to_string()]);
         let (lifeline_r, lifeline_w) = io::pipe()?;
         cmd.stdin(lifeline_r)
             .stdout(Stdio::piped())
@@ -417,10 +480,13 @@ impl Manager {
         let mut child = match self.spawner.spawn(cmd) {
             Ok(c) => c,
             Err(e) => {
-                remove_cgroup(&cgroup);
+                if let Some(g) = &cgroup {
+                    remove_group(g);
+                }
                 return Err(e);
             }
         };
+        drop(listener); // the child holds it now
         let console = Arc::new(Mutex::new(VecDeque::new()));
         capture(child.stdout.take().expect("piped"), &console);
         capture(child.stderr.take().expect("piped"), &console);
@@ -429,7 +495,6 @@ impl Manager {
 
     #[cfg(target_os = "linux")]
     fn make_cgroup(&self, id: &str, cmd: &mut Command) -> io::Result<Option<CgroupGroup>> {
-        use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
         let Some(root) = &self.cgroups else {
             return Ok(None);
@@ -466,78 +531,35 @@ impl Manager {
     /// Wait until the relay answers Ready, which it sends once the guest
     /// agent has.
     fn wait_ready(&self, m: &Machine) -> io::Result<()> {
-        let deadline = Instant::now() + BOOT_TIMEOUT;
-        let mut conn = loop {
-            if let Some(status) = m.child.lock().expect("child lock").try_wait()? {
-                return Err(io::Error::other(format!(
-                    "VMM exited during boot ({status})"
-                )));
+        let mut conn = UnixStream::connect(m.relay())?;
+        conn.set_read_timeout(Some(BOOT_TIMEOUT))?;
+        match expect_ready(&mut conn) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                Err(io::Error::other("timed out waiting for the guest agent"))
             }
-            if Instant::now() >= deadline {
-                return Err(io::Error::other("timed out waiting for the guest agent"));
-            }
-            match self.connect_relay(m) {
-                Ok(c) => break c,
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                    ) =>
-                {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(e) => return Err(e),
-            }
-        };
-        conn.set_read_timeout(Some(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_millis(1)),
-        ))?;
-        expect_ready(&mut conn)
-    }
-
-    /// Connect to the machine's relay, refusing any socket not owned by
-    /// the machine's uid: its directory belongs to that uid, so the path
-    /// could have been swapped.
-    fn connect_relay(&self, m: &Machine) -> io::Result<UnixStream> {
-        let conn = UnixStream::connect(m.relay())?;
-        if let Some(want) = m.uid {
-            let got = peer_uid(&conn)?;
-            if got != want {
-                return Err(io::Error::other(format!(
-                    "relay socket peer is uid {got}, not the machine's uid {want}"
-                )));
-            }
+            r => r,
         }
-        Ok(conn)
     }
 
-    /// A running machine.
-    fn get(&self, id: &str) -> Result<Arc<Machine>> {
+    /// A machine in the map, in any state.
+    fn lookup(&self, id: &str) -> Option<Arc<Machine>> {
         self.machines
             .lock()
             .expect("machines lock")
             .get(id)
-            .filter(|m| *m.state.lock().expect("state lock") == State::Running)
             .cloned()
-            .ok_or_else(|| Error::new(404, format!("no running machine {id}")))
     }
 
     /// A machine's current info, or its last known state from the log.
     pub fn info(&self, id: &str) -> Result<serde_json::Value> {
-        if let Some(m) = self.machines.lock().expect("machines lock").get(id) {
+        if let Some(m) = self.lookup(id) {
             return Ok(m.info());
         }
         let Some(last) = self.log.last_of(id, "machine.")? else {
             return Err(Error::new(404, format!("no machine {id}")));
         };
         let created = self.log.read(id, 1, 1)?.pop();
-        let failed = self
-            .log
-            .read(id, 1, 1_000_000)?
-            .iter()
-            .any(|e| e.kind == "machine.failed");
+        let failed = self.log.last_of(id, "machine.failed")?.is_some();
         let state = match last.kind.as_str() {
             "machine.destroyed" if failed => "failed",
             "machine.destroyed" => "destroyed",
@@ -554,11 +576,16 @@ impl Manager {
     }
 
     /// Record the start of an exec and return its ID and the sequence
-    /// number of its first event. The exec itself runs in [`run_exec`].
+    /// number of its first event. The exec itself runs in [`Self::run_exec`].
     pub fn begin_exec(&self, id: &str, args: &ExecArgs) -> Result<(String, u64)> {
-        let m = self.get(id)?;
         if args.cmd.is_empty() {
             return Err(Error::new(400, "cmd must not be empty"));
+        }
+        if args.request_size() > MAX_REQUEST {
+            return Err(Error::new(
+                400,
+                format!("cmd, env and cwd are over {MAX_REQUEST} bytes"),
+            ));
         }
         if let Some(t) = args.timeout
             && (t.is_zero() || t > self.cfg.exec_max)
@@ -571,6 +598,16 @@ impl Manager {
                 ),
             ));
         }
+        let not_running = || Error::new(404, format!("no running machine {id}"));
+        let m = self.lookup(id).ok_or_else(not_running)?;
+        // Under the state lock: a destroy either sees this exec as busy and
+        // waits for its end, or this sees the machine stopping.
+        let state = m.state.lock().expect("state lock");
+        match *state {
+            State::Starting => return Err(Error::new(409, "the machine is still starting")),
+            State::Stopping => return Err(not_running()),
+            State::Running => {}
+        }
         if m.busy
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
@@ -580,6 +617,7 @@ impl Manager {
                 "an exec is already running on this machine",
             ));
         }
+        drop(state);
         *m.last_active.lock().expect("lock") = Instant::now();
         let exec = format!("e{}", m.execs.fetch_add(1, Ordering::SeqCst) + 1);
         match self
@@ -594,10 +632,11 @@ impl Manager {
         }
     }
 
-    /// Run an exec that [`begin_exec`] recorded. Its output and result go
-    /// to the event log; this returns when it has ended.
+    /// Run an exec that [`Self::begin_exec`] recorded. Its output and
+    /// result go to the event log; this returns when it has ended. Always
+    /// records an end (`exec.exited`, `exec.timedout` or `exec.failed`).
     pub fn run_exec(&self, id: &str, exec: &str, args: ExecArgs) {
-        let Ok(m) = self.get(id) else {
+        let Some(m) = self.lookup(id) else {
             let _ = self.log.append(
                 id,
                 "exec.failed",
@@ -608,27 +647,46 @@ impl Manager {
         let timeout = args.timeout.unwrap_or(self.cfg.exec_max);
         let timed_out = Arc::new(AtomicBool::new(false));
         let result = self.exchange(&m, exec, args, timeout, &timed_out);
-        let end = match result {
-            Ok(()) => None,
+        let stopping = m.state() == State::Stopping;
+        let end = match &result {
+            Ok(Ended::Exited) => None,
+            Ok(Ended::OverQuota) => Some((
+                "exec.failed",
+                json!({"exec": exec, "reason": "machine wrote too much to the event log"}),
+            )),
+            Ok(Ended::TimedOut) => Some((
+                "exec.timedout",
+                json!({"exec": exec, "timeoutMs": timeout.as_millis() as u64}),
+            )),
             Err(_) if timed_out.load(Ordering::SeqCst) => Some((
                 "exec.timedout",
                 json!({"exec": exec, "timeoutMs": timeout.as_millis() as u64}),
             )),
-            Err(e) => {
-                let stopping = *m.state.lock().expect("state lock") != State::Running;
-                let reason = if stopping {
-                    "machine stopped".to_owned()
-                } else {
-                    e.to_string()
-                };
-                Some(("exec.failed", json!({"exec": exec, "reason": reason})))
-            }
+            Err(_) if stopping => Some((
+                "exec.failed",
+                json!({"exec": exec, "reason": "machine stopped"}),
+            )),
+            Err(e) => Some((
+                "exec.failed",
+                json!({"exec": exec, "reason": e.to_string()}),
+            )),
         };
         if let Some((kind, data)) = end {
             let _ = self.log.append(id, kind, data);
         }
         *m.last_active.lock().expect("lock") = Instant::now();
         m.busy.store(false, Ordering::SeqCst);
+        match &result {
+            Ok(Ended::OverQuota) => {
+                self.destroy_machine(&m, "event log quota reached", true);
+            }
+            // The relay did not even answer: the machine is wedged, and no
+            // later exec would get through either.
+            Err(Failure::NoAnswer(e)) if !stopping => {
+                self.destroy_machine(&m, &format!("machine stopped answering: {e}"), true);
+            }
+            _ => {}
+        }
     }
 
     fn exchange(
@@ -638,31 +696,33 @@ impl Manager {
         args: ExecArgs,
         timeout: Duration,
         timed_out: &Arc<AtomicBool>,
-    ) -> io::Result<()> {
-        let mut conn = self.connect_relay(m)?;
-        conn.set_read_timeout(Some(BOOT_TIMEOUT))?;
-        expect_ready(&mut conn)?;
-        conn.set_read_timeout(None)?;
+    ) -> std::result::Result<Ended, Failure> {
+        let mut conn = UnixStream::connect(m.relay()).map_err(Failure::NoAnswer)?;
+        conn.set_read_timeout(Some(BOOT_TIMEOUT))
+            .map_err(Failure::Other)?;
+        expect_ready(&mut conn).map_err(Failure::NoAnswer)?;
+        conn.set_read_timeout(None).map_err(Failure::Other)?;
 
-        // Hanging up ends the exchange whatever it is blocked on; the guest
-        // then kills the command's process group.
+        // The guest kills the command at `timeout`. As a backstop, hanging
+        // up a little later ends the exchange whatever it is blocked on.
+        let hangup = conn.try_clone().map_err(Failure::Other)?;
+        let _hangup_on_return = ShutdownOnDrop(conn.try_clone().map_err(Failure::Other)?);
         let done = Arc::new(AtomicBool::new(false));
+        let _done_on_return = SetOnDrop(Arc::clone(&done));
         {
-            let (conn, done, timed_out) =
-                (conn.try_clone()?, Arc::clone(&done), Arc::clone(timed_out));
-            let deadline = Instant::now() + timeout;
+            let (done, timed_out) = (Arc::clone(&done), Arc::clone(timed_out));
+            let deadline = Instant::now() + timeout + HOST_TIMEOUT_GRACE;
             thread::spawn(move || {
                 while !done.load(Ordering::SeqCst) {
                     if Instant::now() >= deadline {
                         timed_out.store(true, Ordering::SeqCst);
-                        let _ = conn.shutdown(Shutdown::Both);
+                        let _ = hangup.shutdown(Shutdown::Both);
                         return;
                     }
                     thread::sleep(Duration::from_millis(20));
                 }
             });
         }
-        let _end = SetOnDrop(Arc::clone(&done));
 
         write_frame(
             &mut conn,
@@ -670,73 +730,138 @@ impl Manager {
                 argv: args.cmd,
                 env: args.env,
                 cwd: args.cwd,
+                timeout_ms: Some(timeout.as_millis() as u64),
             }),
-        )?;
-        // Fed from its own thread so output is read while input is sent.
-        let mut feeder = conn.try_clone()?;
+        )
+        .map_err(Failure::Other)?;
+        // Fed from its own thread so output is read while input is sent. It
+        // ends when the input is sent or the connection is shut down.
+        let mut feeder = conn.try_clone().map_err(Failure::Other)?;
         let stdin = args.stdin;
-        thread::spawn(move || -> io::Result<()> {
+        let feeding = thread::spawn(move || -> io::Result<()> {
             for chunk in stdin.chunks(STDIN_CHUNK) {
                 write_frame(&mut feeder, &Frame::Stdin(chunk.to_vec()))?;
             }
             write_frame(&mut feeder, &Frame::Stdin(Vec::new()))
         });
+        let result = self.pass_output(m, exec, conn);
+        drop(_hangup_on_return);
+        let _ = feeding.join();
+        result
+    }
 
-        let id = &m.id;
+    /// Read the relay's frames and log them, with the host's own limits:
+    /// each stream is cut at [`DEFAULT_OUTPUT_CAP`], at most [`MAX_ERRORS`]
+    /// errors, and the machine's log quota. Output is gathered into pieces
+    /// so that many small frames do not make many events.
+    fn pass_output(
+        &self,
+        m: &Machine,
+        exec: &str,
+        conn: UnixStream,
+    ) -> std::result::Result<Ended, Failure> {
+        let frames = read_frames(conn);
+        let mut out = OutputBuffer::new("exec.stdout");
+        let mut err = OutputBuffer::new("exec.stderr");
+        let mut errors = 0;
+        let log = |kind: &str, data: serde_json::Value, size: usize| -> io::Result<bool> {
+            if !m.charge(size) {
+                return Ok(false);
+            }
+            self.log.append(&m.id, kind, data).map(|_| true)
+        };
+        let flush = |b: &mut OutputBuffer| -> io::Result<bool> {
+            match b.take() {
+                Some(data) => log(
+                    b.kind,
+                    json!({"exec": exec, "data": B64.encode(&data)}),
+                    data.len(),
+                ),
+                None => Ok(true),
+            }
+        };
         loop {
-            match read_frame(&mut conn)? {
-                Some(Frame::Stdout(b)) => {
-                    self.log.append(
-                        id,
-                        "exec.stdout",
-                        json!({"exec": exec, "data": B64.encode(b)}),
-                    )?;
+            let frame = match frames.recv_timeout(FLUSH_EVERY) {
+                Ok(f) => f,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if !(flush(&mut out).map_err(Failure::Other)?
+                        && flush(&mut err).map_err(Failure::Other)?)
+                    {
+                        return Ok(Ended::OverQuota);
+                    }
+                    continue;
                 }
-                Some(Frame::Stderr(b)) => {
-                    self.log.append(
-                        id,
-                        "exec.stderr",
-                        json!({"exec": exec, "data": B64.encode(b)}),
-                    )?;
-                }
-                Some(Frame::Error(msg)) => {
-                    self.log.append(
-                        id,
-                        "exec.error",
-                        json!({"exec": exec, "message": crate::sanitize(&msg, 4096)}),
-                    )?;
-                }
-                Some(Frame::Exit(s)) => {
-                    self.log.append(
-                        id,
-                        "exec.exited",
-                        json!({
-                            "exec": exec,
-                            "code": s.code,
-                            "stdoutTruncated": s.stdout_truncated,
-                            "stderrTruncated": s.stderr_truncated,
-                        }),
-                    )?;
-                    return Ok(());
-                }
-                Some(other) => {
-                    return Err(io::Error::other(format!(
-                        "unexpected {} frame",
-                        other.kind()
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(Failure::Other(io::Error::other(
+                        "the reader stopped without a reason",
                     )));
                 }
-                None => return Err(io::Error::other("the machine closed the connection")),
+            };
+            let frame = frame.map_err(Failure::Other)?;
+            let (b, other) = match frame {
+                Some(Frame::Stdout(b)) => (b, &mut out),
+                Some(Frame::Stderr(b)) => (b, &mut err),
+                Some(Frame::Error(msg)) => {
+                    errors += 1;
+                    if errors > MAX_ERRORS {
+                        return Err(Failure::Other(io::Error::other(
+                            "machine sent too many errors",
+                        )));
+                    }
+                    let msg = crate::sanitize(&msg, 4096);
+                    let n = msg.len();
+                    if !log("exec.error", json!({"exec": exec, "message": msg}), n)
+                        .map_err(Failure::Other)?
+                    {
+                        return Ok(Ended::OverQuota);
+                    }
+                    continue;
+                }
+                Some(Frame::Exit(s)) => {
+                    if !(flush(&mut out).map_err(Failure::Other)?
+                        && flush(&mut err).map_err(Failure::Other)?)
+                    {
+                        return Ok(Ended::OverQuota);
+                    }
+                    if s.timed_out {
+                        return Ok(Ended::TimedOut);
+                    }
+                    self.log
+                        .append(
+                            &m.id,
+                            "exec.exited",
+                            json!({
+                                "exec": exec,
+                                "code": s.code,
+                                "stdoutTruncated": s.stdout_truncated || out.cut,
+                                "stderrTruncated": s.stderr_truncated || err.cut,
+                            }),
+                        )
+                        .map_err(Failure::Other)?;
+                    return Ok(Ended::Exited);
+                }
+                Some(other) => {
+                    return Err(Failure::Other(io::Error::other(format!(
+                        "unexpected {} frame",
+                        other.kind()
+                    ))));
+                }
+                None => {
+                    return Err(Failure::Other(io::Error::other(
+                        "the machine closed the connection",
+                    )));
+                }
+            };
+            other.push(&b);
+            if other.full() && !flush(other).map_err(Failure::Other)? {
+                return Ok(Ended::OverQuota);
             }
         }
     }
 
     pub fn destroy(&self, id: &str) -> Result<()> {
         let m = self
-            .machines
-            .lock()
-            .expect("machines lock")
-            .get(id)
-            .cloned()
+            .lookup(id)
             .ok_or_else(|| Error::new(404, format!("no running machine {id}")))?;
         self.destroy_machine(&m, "destroyed by request", false);
         Ok(())
@@ -759,7 +884,8 @@ impl Manager {
     }
 
     /// Stop a machine and remove everything it had. Safe to call twice;
-    /// the second call returns at once.
+    /// the second call returns at once. Its last event is always
+    /// `machine.destroyed`.
     fn destroy_machine(&self, m: &Machine, reason: &str, failed: bool) {
         {
             let mut state = m.state.lock().expect("state lock");
@@ -778,25 +904,41 @@ impl Manager {
             thread::sleep(Duration::from_millis(20));
         }
         // The final stop needs nothing from the VMM or its supervisor.
-        #[cfg(target_os = "linux")]
         if let Some(g) = &m.cgroup {
-            let _ = g.kill();
+            kill_group(g);
         }
         let _ = child.kill();
         let _ = child.wait();
         drop(child);
-        #[cfg(target_os = "linux")]
-        if let Some(g) = &m.cgroup {
-            let _ = g.kill(); // anything that raced in
-            if g.populated() {
-                eprintln!("sandpiperd: machine {} cgroup still populated", m.id);
-            }
-            let _ = g.remove();
+        // The machine is gone, so an exec in flight ends at once; let it
+        // record its end before the machine's.
+        let deadline = Instant::now() + EXEC_SETTLE;
+        while m.busy.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
         }
+        let freed = m.cgroup.as_ref().is_none_or(|g| {
+            kill_group(g); // anything that raced in
+            remove_group(g)
+        });
         let _ = fs::remove_dir_all(&m.dir);
-        self.free_uid(m.uid);
+        if freed {
+            self.free_slot(m.slot);
+        } else {
+            eprintln!(
+                "sandpiperd: machine {}: processes are left in its cgroup; uid {} is quarantined",
+                m.id,
+                m.uid.unwrap_or_default()
+            );
+        }
         let _ = self.finish(&m.id, failed.then_some(reason), reason);
         self.machines.lock().expect("machines lock").remove(&m.id);
+        if !freed && let Some(g) = &m.cgroup {
+            // Keep the cgroup to try again; the slot stays taken.
+            self.quarantine
+                .lock()
+                .expect("quarantine lock")
+                .push((m.slot, g.clone()));
+        }
         if let Some(console) = console
             && !console.is_empty()
         {
@@ -815,7 +957,8 @@ impl Manager {
         Ok(())
     }
 
-    /// Stop machines whose time is up or whose VMM has exited.
+    /// Stop machines whose time is up or whose VMM has exited, and retry
+    /// quarantined cgroups.
     fn reap(&self) {
         let all: Vec<_> = self
             .machines
@@ -824,8 +967,9 @@ impl Manager {
             .values()
             .cloned()
             .collect();
+        let mut ending = Vec::new();
         for m in all {
-            if *m.state.lock().expect("state lock") != State::Running {
+            if m.state() == State::Stopping {
                 continue;
             }
             let exited = m
@@ -835,7 +979,8 @@ impl Manager {
                 .try_wait()
                 .ok()
                 .flatten();
-            let idle = !m.busy.load(Ordering::SeqCst)
+            let idle = m.state() == State::Running
+                && !m.busy.load(Ordering::SeqCst)
                 && m.last_active.lock().expect("lock").elapsed() >= m.idle;
             let (reason, failed) = if let Some(status) = exited {
                 (format!("VMM exited ({status})"), true)
@@ -846,31 +991,159 @@ impl Manager {
             } else {
                 continue;
             };
-            self.destroy_machine(&m, &reason, failed);
+            ending.push((m, reason, failed));
+        }
+        // Each in its own thread: one slow stop must not hold up the rest.
+        thread::scope(|s| {
+            for (m, reason, failed) in &ending {
+                s.spawn(|| self.destroy_machine(m, reason, *failed));
+            }
+        });
+        let mut q = self.quarantine.lock().expect("quarantine lock");
+        q.retain(|(slot, g)| {
+            kill_group(g);
+            if remove_group(g) {
+                self.free_slot(*slot);
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
+/// How an exchange ended, short of an error.
+enum Ended {
+    Exited,
+    /// The guest stopped the command at its timeout.
+    TimedOut,
+    OverQuota,
+}
+
+enum Failure {
+    /// The relay did not answer at all.
+    NoAnswer(io::Error),
+    Other(io::Error),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::NoAnswer(e) | Failure::Other(e) => e.fmt(f),
         }
     }
 }
 
-#[cfg(target_os = "linux")]
-type CgroupGroup = crate::cgroup::Group;
-#[cfg(not(target_os = "linux"))]
-type CgroupGroup = ();
+/// One output stream of an exec, gathered into pieces and cut at the cap.
+struct OutputBuffer {
+    kind: &'static str,
+    pending: Vec<u8>,
+    total: usize,
+    cut: bool,
+}
 
-#[cfg(target_os = "linux")]
-fn remove_cgroup(g: &Option<CgroupGroup>) {
-    if let Some(g) = g {
-        let _ = g.remove();
+impl OutputBuffer {
+    fn new(kind: &'static str) -> Self {
+        Self {
+            kind,
+            pending: Vec::new(),
+            total: 0,
+            cut: false,
+        }
+    }
+
+    fn push(&mut self, b: &[u8]) {
+        let room = DEFAULT_OUTPUT_CAP.saturating_sub(self.total);
+        let take = b.len().min(room);
+        self.cut |= take < b.len();
+        self.pending.extend_from_slice(&b[..take]);
+        self.total += take;
+    }
+
+    fn full(&self) -> bool {
+        self.pending.len() >= OUTPUT_PIECE
+    }
+
+    fn take(&mut self) -> Option<Vec<u8>> {
+        (!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending))
     }
 }
 
+/// Read frames on their own thread, so the reader can wait with a timeout
+/// without ever stopping mid-frame.
+fn read_frames(mut conn: UnixStream) -> mpsc::Receiver<io::Result<Option<Frame>>> {
+    let (tx, rx) = mpsc::sync_channel(16);
+    thread::spawn(move || {
+        loop {
+            let f = read_frame(&mut conn);
+            let last = !matches!(f, Ok(Some(_)));
+            if tx.send(f).is_err() || last {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+#[cfg(target_os = "linux")]
+type CgroupGroup = crate::cgroup::Group;
+/// Machines get no cgroup off Linux.
 #[cfg(not(target_os = "linux"))]
-fn remove_cgroup(_: &Option<CgroupGroup>) {}
+#[derive(Clone)]
+struct CgroupGroup;
+
+#[cfg(target_os = "linux")]
+fn kill_group(g: &CgroupGroup) {
+    let _ = g.kill();
+}
+
+/// Remove an emptied cgroup; false if processes are still in it.
+#[cfg(target_os = "linux")]
+fn remove_group(g: &CgroupGroup) -> bool {
+    !g.populated() && g.remove().is_ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kill_group(_: &CgroupGroup) {}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_group(_: &CgroupGroup) -> bool {
+    true
+}
 
 struct SetOnDrop(Arc<AtomicBool>);
 
 impl Drop for SetOnDrop {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+struct ShutdownOnDrop(UnixStream);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(Shutdown::Both);
+    }
+}
+
+/// Make `fd` the child's descriptor `to`, open across exec.
+fn pass_fd(cmd: &mut Command, fd: i32, to: i32) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: dup2 and fcntl only, which are safe between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            let rc = if fd == to {
+                libc::fcntl(fd, libc::F_SETFD, 0)
+            } else {
+                libc::dup2(fd, to)
+            };
+            if rc < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
     }
 }
 
@@ -907,7 +1180,6 @@ fn capture<R: Read + Send + 'static>(mut src: R, tail: &Arc<Mutex<VecDeque<u8>>>
 fn copy_image(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        use std::os::fd::AsRawFd;
         let src = fs::File::open(from)?;
         let dst = fs::File::create(to)?;
         // SAFETY: FICLONE on two open files; failure falls back to a copy.
@@ -918,42 +1190,33 @@ fn copy_image(from: &Path, to: &Path) -> io::Result<()> {
     fs::copy(from, to).map(drop)
 }
 
-fn chown_tree(dir: &Path, id: u32) -> io::Result<()> {
-    std::os::unix::fs::chown(dir, Some(id), Some(id))?;
-    for entry in fs::read_dir(dir)? {
-        std::os::unix::fs::chown(entry?.path(), Some(id), Some(id))?;
-    }
-    Ok(())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[cfg(target_os = "linux")]
-fn peer_uid(conn: &UnixStream) -> io::Result<u32> {
-    use std::os::fd::AsRawFd;
-    let mut cred = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: getsockopt into a correctly sized ucred.
-    let rc = unsafe {
-        libc::getsockopt(
-            conn.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut cred as *mut libc::ucred).cast(),
-            &mut len,
-        )
-    };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
+    #[test]
+    fn output_buffer_cuts_at_the_cap_and_fills_pieces() {
+        let mut b = OutputBuffer::new("exec.stdout");
+        b.push(&vec![0; OUTPUT_PIECE - 1]);
+        assert!(!b.full());
+        b.push(&[1]);
+        assert!(b.full());
+        assert_eq!(b.take().unwrap().len(), OUTPUT_PIECE);
+        assert!(b.take().is_none());
+        b.push(&vec![0; DEFAULT_OUTPUT_CAP]);
+        assert!(b.cut);
+        assert_eq!(b.total, DEFAULT_OUTPUT_CAP);
     }
-    Ok(cred.uid)
-}
 
-#[cfg(not(target_os = "linux"))]
-fn peer_uid(_: &UnixStream) -> io::Result<u32> {
-    Err(io::Error::other(
-        "peer credentials are checked on Linux only",
-    ))
+    #[test]
+    fn request_size_counts_everything() {
+        let a = ExecArgs {
+            cmd: vec!["ab".into(), "c".into()],
+            env: vec![("K".into(), "vv".into())],
+            cwd: Some("/w".into()),
+            stdin: vec![0; 100],
+            timeout: None,
+        };
+        assert_eq!(a.request_size(), 3 + 3 + 2);
+    }
 }

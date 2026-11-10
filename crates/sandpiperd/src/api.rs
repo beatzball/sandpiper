@@ -250,11 +250,14 @@ async fn exec(
     tokio::task::spawn_blocking(move || mgr.run_exec(&id2, &exec2, args));
     let mine = move |e: &Event| e.str("exec") == Some(exec.as_str());
     let mine2 = mine.clone();
+    // The machine's end goes out too, so a client can tell it from a
+    // dropped connection.
+    let keep = move |e: &Event| mine(e) || e.kind == "machine.destroyed";
     Ok(ndjson(follow(
         Arc::clone(&app.log),
         id,
         seq,
-        mine,
+        keep,
         move |e| {
             e.kind == "machine.destroyed"
                 || (mine2(e)
