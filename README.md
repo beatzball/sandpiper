@@ -9,7 +9,10 @@ One platform runs two kinds of workload on hardware you control:
 - **plover** — long-lived services with a domain and TLS.
 
 **Status:** M0 works on Apple Silicon: a microVM boots and runs a command
-over vsock, about 120 ms warm. Development only — no isolation claims yet
+over vsock, about 120 ms warm. M1 has started on Linux KVM: machines boot
+from their own disk image, the VMM runs sandboxed (own uid, namespaces,
+seccomp), and workloads run unprivileged and cannot reach vsock. No
+isolation claims until M1 is done on a real host
 (see [DESIGN.md §12](DESIGN.md#12-hosting)).
 
 ## Try M0 (macOS, Apple Silicon)
@@ -24,6 +27,17 @@ scripts/m0.sh uname -a             # any command in an Alpine guest
 The script downloads and checks an Alpine minirootfs, cross-compiles the guest
 agent, ad-hoc signs `sandpiper-vmm` with the hypervisor entitlement, and runs
 the command. The guest has no network device.
+
+## Try M1 so far (Linux with KVM)
+
+```sh
+scripts/install-libkrun-linux.sh          # once; see docs/host-setup.md §4.1
+rustup target add "$(uname -m)-unknown-linux-musl"
+scripts/m1-smoke.sh                       # builds the image, runs the checks
+```
+
+On an M3 or newer Mac, a Lima VM with nested virtualization works for
+development (docs/host-setup.md §0.1).
 
 ## Layout
 

@@ -239,6 +239,57 @@ mod tests {
         assert!(buf.is_empty());
     }
 
+    /// A stable stand-in for the fuzz target in `fuzz/`, so CI exercises
+    /// the decoder with hostile input on every change: random streams, and
+    /// valid frames with random bytes flipped.
+    #[test]
+    fn decoder_survives_random_and_mutated_input() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut valid = Vec::new();
+        for f in [
+            Frame::Ready { version: 1 },
+            Frame::Exec(ExecRequest {
+                argv: vec!["sh".into(), "-c".into(), "true".into()],
+                env: vec![("K".into(), "v".into())],
+                cwd: None,
+            }),
+            Frame::Stdout(b"output".to_vec()),
+            Frame::Exit(ExitStatus {
+                code: 3,
+                stdout_truncated: false,
+                stderr_truncated: true,
+            }),
+        ] {
+            write_frame(&mut valid, &f).unwrap();
+        }
+        for round in 0..20_000 {
+            let input: Vec<u8> = if round % 2 == 0 {
+                let len = (next() % 64) as usize;
+                (0..len).map(|_| next() as u8).collect()
+            } else {
+                let mut v = valid.clone();
+                for _ in 0..=(next() % 4) {
+                    let i = (next() as usize) % v.len();
+                    v[i] = next() as u8;
+                }
+                v
+            };
+            let mut r = input.as_slice();
+            while let Ok(Some(frame)) = read_frame(&mut r) {
+                let mut buf = Vec::new();
+                if write_frame(&mut buf, &frame).is_ok() {
+                    assert_eq!(read_frame(&mut buf.as_slice()).unwrap(), Some(frame));
+                }
+            }
+        }
+    }
+
     #[test]
     fn bad_fixed_size_payloads_are_errors() {
         assert!(Frame::decode_payload(T_READY, vec![1]).is_err());

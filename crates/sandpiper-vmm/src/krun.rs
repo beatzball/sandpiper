@@ -11,6 +11,20 @@ mod ffi {
         pub fn krun_create_ctx() -> i32;
         pub fn krun_set_vm_config(ctx: u32, num_vcpus: u8, ram_mib: u32) -> i32;
         pub fn krun_set_root(ctx: u32, root_path: *const c_char) -> i32;
+        pub fn krun_add_disk(
+            ctx: u32,
+            block_id: *const c_char,
+            disk_path: *const c_char,
+            read_only: bool,
+        ) -> i32;
+        pub fn krun_set_root_disk_remount(
+            ctx: u32,
+            device: *const c_char,
+            fstype: *const c_char,
+            options: *const c_char,
+        ) -> i32;
+        pub fn krun_setuid(ctx: u32, uid: u32) -> i32;
+        pub fn krun_setgid(ctx: u32, gid: u32) -> i32;
         pub fn krun_disable_implicit_vsock(ctx: u32) -> i32;
         pub fn krun_add_vsock(ctx: u32, tsi_features: u32) -> i32;
         pub fn krun_add_vsock_port2(ctx: u32, port: u32, path: *const c_char, listen: bool) -> i32;
@@ -61,8 +75,16 @@ impl CStrArray {
     }
 }
 
+pub enum Root<'a> {
+    /// A host directory shared over virtio-fs (M0, development only).
+    Dir(&'a str),
+    /// An ext4 image attached as the first virtio-blk device and mounted as
+    /// `/`. The image is this machine's own copy: the guest writes to it.
+    Disk(&'a str),
+}
+
 pub struct VmConfig<'a> {
-    pub root: &'a str,
+    pub root: Root<'a>,
     pub vcpus: u8,
     pub ram_mib: u32,
     /// Host Unix socket that libkrun listens on and forwards to the guest port.
@@ -72,6 +94,13 @@ pub struct VmConfig<'a> {
     /// Passed explicitly: a NULL envp would copy the host environment
     /// (home directory, user name) into the guest.
     pub env: &'a [&'a str],
+    /// The unprivileged uid and gid libkrun switches to inside
+    /// `krun_start_enter`, before it opens `/dev/kvm` and the disk: both
+    /// must be usable by this uid.
+    pub run_as: Option<(u32, u32)>,
+    /// Runs last, after libkrun is configured and before it takes over the
+    /// process. The sandbox installs its seccomp filter here.
+    pub before_enter: &'a dyn Fn() -> io::Result<()>,
 }
 
 /// Configure a microVM and enter it. On success this never returns: libkrun
@@ -88,10 +117,29 @@ pub fn boot(cfg: &VmConfig) -> io::Result<std::convert::Infallible> {
             "krun_set_vm_config",
             ffi::krun_set_vm_config(ctx, cfg.vcpus, cfg.ram_mib),
         )?;
-        check(
-            "krun_set_root",
-            ffi::krun_set_root(ctx, cstr(cfg.root)?.as_ptr()),
-        )?;
+        match cfg.root {
+            Root::Dir(dir) => {
+                check(
+                    "krun_set_root",
+                    ffi::krun_set_root(ctx, cstr(dir)?.as_ptr()),
+                )?;
+            }
+            Root::Disk(image) => {
+                check(
+                    "krun_add_disk",
+                    ffi::krun_add_disk(ctx, cstr("root")?.as_ptr(), cstr(image)?.as_ptr(), false),
+                )?;
+                check(
+                    "krun_set_root_disk_remount",
+                    ffi::krun_set_root_disk_remount(
+                        ctx,
+                        cstr("/dev/vda")?.as_ptr(),
+                        cstr("ext4")?.as_ptr(),
+                        std::ptr::null(),
+                    ),
+                )?;
+            }
+        }
         // No TSI: the guest gets vsock for the agent and no network at all.
         check(
             "krun_disable_implicit_vsock",
@@ -117,6 +165,11 @@ pub fn boot(cfg: &VmConfig) -> io::Result<std::convert::Infallible> {
                 envp.ptrs.as_ptr(),
             ),
         )?;
+        if let Some((uid, gid)) = cfg.run_as {
+            check("krun_setgid", ffi::krun_setgid(ctx, gid))?;
+            check("krun_setuid", ffi::krun_setuid(ctx, uid))?;
+        }
+        (cfg.before_enter)()?;
         let rc = ffi::krun_start_enter(ctx);
         Err(io::Error::other(format!("krun_start_enter returned {rc}")))
     }
