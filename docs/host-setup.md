@@ -128,17 +128,35 @@ and builds the pinned libkrun with block and network devices into
 rustup target add "$(uname -m)-unknown-linux-musl"
 scripts/m1-smoke.sh
 scripts/m1-api-smoke.sh
+scripts/m1-wall-smoke.sh
 ```
+
+`m1-wall-smoke.sh` also builds test binaries in `target/wall-tests` that
+start machines with a wall open on purpose. Never install those.
 
 ### 4.2 Run the host agent
 
 ```sh
 cargo build --release -p sandpiperd -p sandpiper-vmm
+TEMPLATE=node scripts/m1-image.sh                 # Alpine + Node.js
 sudo install -m 0755 target/release/sandpiperd target/release/sandpiper-vmm /usr/local/bin/
 sudo install -D -m 0644 target/m1/base.img /var/lib/sandpiper/templates/base.img
+sudo install -D -m 0644 target/m1/node.img /var/lib/sandpiper/templates/node.img
 sudo install -m 0644 packaging/sandpiperd.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now sandpiperd
 ```
+
+The host agent refuses to start if SMT (hyper-threading) is on or CPU
+mitigations are off (DESIGN.md §12). Turn SMT off with `nosmt` on the
+kernel command line (in `/etc/default/grub`, then `sudo update-grub` and
+reboot). Only on a box that never runs untrusted code, pass
+`--allow-weak-host` instead.
+
+At start it installs its own nftables table, `inet sandpiper`, and checks
+it every 10 s. If another program changes it, `GET /v1/health` reports why
+and no new machine starts until the host agent is restarted. Every machine
+is wall-checked before it is handed out; a machine that fails is
+`failed`, with the reason in its events.
 
 The API listens on `127.0.0.1:7171`. Its token is in
 `/var/lib/sandpiper/token` (root only). Try it:

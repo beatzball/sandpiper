@@ -106,6 +106,59 @@ pub fn probe(what: &str) -> i32 {
     if blocked { 0 } else { 1 }
 }
 
+/// The inside half of the host's wall check (DESIGN.md §4.2), run as a
+/// workload before any other. One line per wall:
+///
+/// - `vsock`: a vsock socket must be refused;
+/// - `net-devices`: the guest must have no network interface backed by a
+///   device (such as virtio-net). Software-only interfaces with nowhere to
+///   send to, such as `lo` and the kernel's `dummy0`, do not count. If the
+///   list cannot be read, the wall counts as open;
+/// - `canary ADDR`: a TCP connection to each of the host's canaries. The
+///   host judges these by whether its listener was reached, not by what
+///   this prints.
+///
+/// Exits 0 only if every line says `blocked`.
+pub fn probe_walls(canaries: &[String]) -> i32 {
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+    let mut all = true;
+    let mut line = |name: &str, blocked: bool| {
+        println!("{name} {}", if blocked { "blocked" } else { "open" });
+        all &= blocked;
+    };
+    line("vsock", probe_quiet("vsock"));
+    let backed = std::fs::read_dir("/sys/class/net").map(|dir| {
+        dir.flatten()
+            .any(|iface| iface.path().join("device").exists())
+    });
+    line("net-devices", matches!(backed, Ok(false)));
+    for c in canaries {
+        let reached = c
+            .parse::<SocketAddr>()
+            .is_ok_and(|addr| TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok());
+        line(&format!("canary {c}"), !reached);
+    }
+    if all { 0 } else { 1 }
+}
+
+/// [`probe`] without its output: whether the wall held.
+fn probe_quiet(what: &str) -> bool {
+    // SAFETY: as in `probe`.
+    unsafe {
+        match what {
+            "vsock" => {
+                let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
+                if fd >= 0 {
+                    libc::close(fd);
+                }
+                fd < 0
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Mix bytes from the host-backed hardware RNG (virtio-rng) into the kernel
 /// pool before any workload runs, so machines booted from one template or
 /// one disk branch never share kernel random state (DESIGN.md §4.4). Fails

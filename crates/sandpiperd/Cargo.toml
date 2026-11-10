@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+# Test builds only: SANDPIPER_BREAK_WALL=tsi|net starts every machine with
+# that wall open, to show the wall check catches it. Needs the VMM built
+# with its own `wall-tests` feature.
+wall-tests = []
+
 [dependencies]
 sandpiper-proto.workspace = true
 libc.workspace = true

@@ -41,6 +41,11 @@ use crate::ids;
 pub const UID_BASE: u32 = 1_900_000_000;
 
 const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the inside wall probe may take.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the firewall table is compared with what was installed.
+#[cfg(target_os = "linux")]
+const FIREWALL_CHECK: Duration = Duration::from_secs(10);
 /// How long an exec waits for the relay's Ready. Longer than boot: a busy
 /// guest answers only after its previous exchange is done.
 const EXEC_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -224,6 +229,9 @@ pub struct Manager {
     stopping: AtomicBool,
     /// Creates in progress, which shutdown waits for.
     creating: AtomicUsize,
+    /// Why this host must not start machines, once something is wrong
+    /// with it (its firewall table changed).
+    degraded: Mutex<Option<String>>,
     #[cfg(target_os = "linux")]
     cgroups: Option<crate::cgroup::Root>,
 }
@@ -311,9 +319,32 @@ impl Manager {
             spawner: Spawner::start(),
             stopping: AtomicBool::new(false),
             creating: AtomicUsize::new(0),
+            degraded: Mutex::new(None),
             #[cfg(target_os = "linux")]
             cgroups,
         });
+        #[cfg(target_os = "linux")]
+        if m.cfg.sandbox {
+            let installed = crate::firewall::install()?;
+            let watch = Arc::downgrade(&m);
+            thread::Builder::new()
+                .name("firewall-watch".into())
+                .spawn(move || {
+                    loop {
+                        thread::sleep(FIREWALL_CHECK);
+                        let Some(m) = watch.upgrade() else { return };
+                        let problem = match crate::firewall::listing() {
+                            Ok(now) if now == installed => continue,
+                            Ok(_) => "another program changed the sandpiper firewall table".into(),
+                            Err(e) => e.to_string(),
+                        };
+                        eprintln!("sandpiperd: ALERT: {problem}; no new machines will start");
+                        *m.degraded.lock().expect("degraded lock") = Some(problem);
+                        return;
+                    }
+                })
+                .expect("spawn thread");
+        }
         let reaper = Arc::downgrade(&m);
         thread::Builder::new()
             .name("reaper".into())
@@ -335,6 +366,9 @@ impl Manager {
         let _done = Decrement(&self.creating);
         if self.stopping.load(Ordering::SeqCst) {
             return Err(Error::new(503, "the host agent is stopping"));
+        }
+        if let Some(problem) = &*self.degraded.lock().expect("degraded lock") {
+            return Err(Error::new(503, format!("this host is degraded: {problem}")));
         }
         let image = self.template_image(&req.template)?;
         let idle = req.idle.unwrap_or(self.cfg.idle);
@@ -408,6 +442,18 @@ impl Manager {
             self.destroy_machine(&machine, &reason, true);
             return Err(Error::new(500, reason));
         }
+        if self.cfg.sandbox {
+            match self.check_walls(&machine) {
+                Ok(passed) => {
+                    let _ = self.log.append(&id, "machine.checked", passed);
+                }
+                Err(e) => {
+                    let reason = format!("wall check failed: {e}");
+                    self.destroy_machine(&machine, &reason, true);
+                    return Err(Error::new(500, reason));
+                }
+            }
+        }
         // Under the state lock, so a destroy cannot slip its events between
         // the check and the record.
         let mut state = machine.state.lock().expect("state lock");
@@ -427,6 +473,92 @@ impl Manager {
         drop(state);
         *machine.last_active.lock().expect("lock") = Instant::now();
         Ok(machine.info())
+    }
+
+    /// Whether this host may start machines, and why not.
+    pub fn health(&self) -> serde_json::Value {
+        match &*self.degraded.lock().expect("degraded lock") {
+            None => json!({"ok": true}),
+            Some(problem) => json!({"ok": false, "reason": problem}),
+        }
+    }
+
+    /// The wall check (see `walls`): outside checks, then the inside probe
+    /// against fresh canaries. Returns what passed, for the record.
+    #[cfg(target_os = "linux")]
+    fn check_walls(&self, m: &Machine) -> std::result::Result<serde_json::Value, String> {
+        use crate::walls;
+        let supervisor = m.child.lock().expect("child lock").id();
+        let vmm = walls::vmm_of(supervisor).map_err(|e| e.to_string())?;
+        let uid = m.uid.ok_or("a sandboxed machine has no uid")?;
+        let mut passed: Vec<String> = walls::outside(vmm, &m.id, uid)?
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let canaries = walls::Canaries::open(vmm).map_err(|e| format!("canaries: {e}"))?;
+        let mut argv = vec![
+            "/sandpiper/guest".to_owned(),
+            "probe".to_owned(),
+            "walls".to_owned(),
+        ];
+        argv.extend(canaries.addrs());
+        let (out, _) = self
+            .probe(m, argv)
+            .map_err(|e| format!("inside probe: {e}"))?;
+        if let Some(name) = canaries.reached() {
+            return Err(format!("a probe from inside reached the {name} canary"));
+        }
+        // The guest's own report, for the walls only it can see.
+        for want in ["vsock", "net-devices"] {
+            let line = out.lines().find(|l| l.split(' ').next() == Some(want));
+            match line {
+                Some(l) if l.ends_with(" blocked") => passed.push(want.to_owned()),
+                Some(_) => return Err(format!("{want} is open inside the guest")),
+                None => return Err(format!("the inside probe did not report {want}")),
+            }
+        }
+        passed.extend(canaries.names().into_iter().map(|n| format!("canary:{n}")));
+        Ok(json!({"walls": passed}))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn check_walls(&self, _: &Machine) -> std::result::Result<serde_json::Value, String> {
+        Err("wall checks need Linux".into())
+    }
+
+    /// Run a host command in the machine as a workload, outside the event
+    /// log. Returns its stdout (first 64 KiB) and exit code.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn probe(&self, m: &Machine, argv: Vec<String>) -> io::Result<(String, i32)> {
+        let mut conn = UnixStream::connect(m.relay())?;
+        conn.set_read_timeout(Some(PROBE_TIMEOUT))?;
+        expect_ready(&mut conn)?;
+        write_frame(
+            &mut conn,
+            &Frame::Exec(ExecRequest {
+                argv,
+                timeout_ms: Some(PROBE_TIMEOUT.as_millis() as u64 / 2),
+                ..Default::default()
+            }),
+        )?;
+        write_frame(&mut conn, &Frame::Stdin(Vec::new()))?;
+        let mut out = Vec::new();
+        loop {
+            match read_frame(&mut conn)? {
+                Some(Frame::Stdout(b)) => {
+                    let room = (64usize << 10).saturating_sub(out.len());
+                    out.extend_from_slice(&b[..b.len().min(room)]);
+                }
+                Some(Frame::Stderr(_) | Frame::Error(_)) => {}
+                Some(Frame::Exit(s)) => {
+                    return Ok((String::from_utf8_lossy(&out).into_owned(), s.code));
+                }
+                Some(other) => {
+                    return Err(io::Error::other(format!("unexpected {}", other.kind())));
+                }
+                None => return Err(io::Error::other("the machine closed the connection")),
+            }
+        }
     }
 
     fn template_image(&self, name: &str) -> Result<PathBuf> {
@@ -488,6 +620,12 @@ impl Manager {
             .args(["--cpus", &self.cfg.cpus.to_string()])
             .args(["--mem", &self.cfg.mem_mib.to_string()])
             .arg("--die-with-parent");
+        // Test builds only: open a wall on purpose, to show the check
+        // catches it.
+        #[cfg(feature = "wall-tests")]
+        if let Ok(wall) = std::env::var("SANDPIPER_BREAK_WALL") {
+            cmd.args(["--break-wall", &wall]);
+        }
         let cgroup = match uid {
             Some(uid) => {
                 std::os::unix::fs::chown(&disk, Some(uid), Some(uid))?;

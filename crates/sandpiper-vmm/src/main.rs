@@ -81,6 +81,7 @@ struct Opts {
     time: bool,
     die_with_parent: bool,
     probe: bool,
+    breach: krun::Breach,
     argv: Vec<String>,
 }
 
@@ -100,6 +101,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         time: false,
         die_with_parent: false,
         probe: false,
+        breach: krun::Breach::None,
         argv: Vec::new(),
     };
     let mut it = args.iter();
@@ -152,6 +154,15 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--time" => o.time = true,
             "--die-with-parent" => o.die_with_parent = true,
             "--probe" => o.probe = true,
+            #[cfg(feature = "wall-tests")]
+            "--break-wall" => {
+                o.breach = match val("--break-wall")?.as_str() {
+                    "tsi" => krun::Breach::Tsi,
+                    // The fd is made at boot, inside the jail.
+                    "net" => krun::Breach::NetDevice(-1),
+                    other => return Err(format!("--break-wall: unknown wall {other:?}")),
+                }
+            }
             "--" => {
                 o.argv = it.cloned().collect();
                 break;
@@ -291,8 +302,28 @@ fn boot(o: &Opts) -> io::Result<std::convert::Infallible> {
         exec_path: GUEST_AGENT,
         env: GUEST_ENV,
         run_as,
+        breach: breach(o.breach)?,
         before_enter: &|| before_enter(run_as.is_some(), disk.as_deref()),
     })
+}
+
+/// Make what a test breach needs: for a network device, a socket pair
+/// whose other end is kept open and never read.
+fn breach(b: krun::Breach) -> io::Result<krun::Breach> {
+    #[cfg(feature = "wall-tests")]
+    if let krun::Breach::NetDevice(_) = b {
+        eprintln!("sandpiper-vmm: TEST BUILD: this machine has a network device");
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+        std::mem::forget(theirs);
+        return Ok(krun::Breach::NetDevice(
+            std::os::fd::IntoRawFd::into_raw_fd(ours),
+        ));
+    }
+    #[cfg(feature = "wall-tests")]
+    if b == krun::Breach::Tsi {
+        eprintln!("sandpiper-vmm: TEST BUILD: this machine has TSI on");
+    }
+    Ok(b)
 }
 
 #[cfg(target_os = "linux")]

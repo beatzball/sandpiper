@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+# Test builds only: `boot --break-wall tsi|net` starts a VMM with a wall
+# deliberately open, to prove the host agent's wall check catches it.
+wall-tests = []
+
 [dependencies]
 sandpiper-proto.workspace = true
 libc.workspace = true

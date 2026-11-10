@@ -42,7 +42,10 @@ pub fn router(app: Arc<App>) -> Router {
         .layer(middleware::from_fn_with_state(Arc::clone(&app), auth))
         .layer(DefaultBodyLimit::max(MAX_BODY));
     Router::new()
-        .route("/v1/health", get(async || Json(json!({"ok": true}))))
+        .route(
+            "/v1/health",
+            get(async |State(app): State<Arc<App>>| Json(app.mgr.health())),
+        )
         .merge(v1)
         .with_state(app)
 }
