@@ -85,7 +85,12 @@ if [ "$MODE" = m1 ]; then
   check "VMM is under a seccomp filter" "2" "$(field Seccomp)"
   check "VMM cannot gain privileges" "1" "$(field NoNewPrivs)"
   for ns in net mnt pid ipc uts; do check "VMM has its own $ns namespace" "own" "$(same_ns $ns)"; done
-  check "VMM sees only dev and machine" "dev machine" "$(ls /proc/$vmm/root | tr '\n' ' ' | sed 's/ $//')"
+  check "VMM sees only dev, its disk and run" "dev disk.img run" "$(ls /proc/$vmm/root | tr '\n' ' ' | sed 's/ $//')"
+  check "VMM's run is a small tmpfs" "size=64k" \
+    "$(awk '$5 == "/run" && $9 == "tmpfs"' /proc/$vmm/mountinfo | grep -o 'size=[0-9]*k')"
+  u=$(stat -c %u /proc/$vmm)
+  check "VMM cannot make files outside its tmpfs" "blocked" \
+    "$(setpriv --reuid="$u" --regid="$u" --clear-groups sh -c "touch /proc/$vmm/root/x 2>/dev/null || touch /proc/$vmm/root/dev/x 2>/dev/null" && echo open || echo blocked)"
   check "VMM's network namespace has no devices but lo" "lo" \
     "$(nsenter -t "$vmm" -n ip -o link show | awk -F': ' '{print $2}' | tr '\n' ' ' | sed 's/ $//')"
   kill "$driver" 2>/dev/null; wait "$driver" 2>/dev/null

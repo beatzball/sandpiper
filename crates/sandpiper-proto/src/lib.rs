@@ -32,21 +32,27 @@ pub const MAX_FRAME: usize = 1 << 20;
 /// Default cap on each output stream of one exec, in bytes.
 pub const DEFAULT_OUTPUT_CAP: usize = 1 << 20;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecRequest {
     pub argv: Vec<String>,
     #[serde(default)]
     pub env: Vec<(String, String)>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The guest kills the command's process group after this long and
+    /// marks its `Exit` as timed out. The host keeps its own, later limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExitStatus {
     /// The process exit code, or 128 + signal number if it was killed.
     pub code: i32,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// The guest killed the command at its `timeout_ms`.
+    pub timed_out: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,7 +101,11 @@ impl Frame {
             Frame::Stderr(b) => (T_STDERR, b.clone()),
             Frame::Exit(s) => {
                 let mut p = s.code.to_be_bytes().to_vec();
-                p.push(u8::from(s.stdout_truncated) | (u8::from(s.stderr_truncated) << 1));
+                p.push(
+                    u8::from(s.stdout_truncated)
+                        | (u8::from(s.stderr_truncated) << 1)
+                        | (u8::from(s.timed_out) << 2),
+                );
                 (T_EXIT, p)
             }
             Frame::Error(msg) => (T_ERROR, msg.as_bytes().to_vec()),
@@ -120,6 +130,7 @@ impl Frame {
                     code: i32::from_be_bytes([b[0], b[1], b[2], b[3]]),
                     stdout_truncated: b[4] & 1 != 0,
                     stderr_truncated: b[4] & 2 != 0,
+                    timed_out: b[4] & 4 != 0,
                 })
             }
             T_ERROR => Frame::Error(String::from_utf8_lossy(&p).into_owned()),
@@ -192,6 +203,7 @@ mod tests {
             argv: vec!["echo".into(), "hello".into()],
             env: vec![("A".into(), "b".into())],
             cwd: Some("/work".into()),
+            timeout_ms: Some(1500),
         }));
         round_trip(Frame::Stdin(b"in".to_vec()));
         round_trip(Frame::Stdin(Vec::new()));
@@ -201,6 +213,7 @@ mod tests {
             code: -1,
             stdout_truncated: true,
             stderr_truncated: false,
+            timed_out: true,
         }));
         round_trip(Frame::Error("no such file".into()));
     }
@@ -257,13 +270,13 @@ mod tests {
             Frame::Exec(ExecRequest {
                 argv: vec!["sh".into(), "-c".into(), "true".into()],
                 env: vec![("K".into(), "v".into())],
-                cwd: None,
+                ..Default::default()
             }),
             Frame::Stdout(b"output".to_vec()),
             Frame::Exit(ExitStatus {
                 code: 3,
-                stdout_truncated: false,
                 stderr_truncated: true,
+                ..Default::default()
             }),
         ] {
             write_frame(&mut valid, &f).unwrap();

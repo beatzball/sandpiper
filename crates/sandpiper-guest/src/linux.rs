@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -99,6 +99,7 @@ fn vsock_accept(listener: &OwnedFd) -> io::Result<File> {
 /// This thread only watches: the child's exit, a host hang-up, the pumps.
 fn handle(conn: File) -> io::Result<()> {
     let mut reader = conn.try_clone()?;
+    let conn_fd = conn.as_raw_fd();
     let writer: Writer = Arc::new(Mutex::new(conn));
     send(
         &writer,
@@ -134,8 +135,7 @@ fn handle(conn: File) -> io::Result<()> {
                 &writer,
                 &Frame::Exit(ExitStatus {
                     code,
-                    stdout_truncated: false,
-                    stderr_truncated: false,
+                    ..Default::default()
                 }),
             );
         }
@@ -150,9 +150,13 @@ fn handle(conn: File) -> io::Result<()> {
     let out = Pump::spawn(child.stdout.take().expect("piped"), &writer, Frame::Stdout);
     let err = Pump::spawn(child.stderr.take().expect("piped"), &writer, Frame::Stderr);
 
-    let status = match wait_or_hangup(&mut child, &hangup)? {
-        Some(status) => status,
-        None => {
+    let deadline = req
+        .timeout_ms
+        .map(|ms| Instant::now() + Duration::from_millis(ms));
+    let (status, timed_out) = match wait_or_hangup(&mut child, &hangup, conn_fd, deadline)? {
+        Waited::Exited(status) => (status, false),
+        Waited::TimedOut(status) => (status, true),
+        Waited::HungUp => {
             out.abandon();
             err.abandon();
             return Err(io::Error::other("host hung up; command killed"));
@@ -191,28 +195,50 @@ fn handle(conn: File) -> io::Result<()> {
             code,
             stdout_truncated,
             stderr_truncated,
+            timed_out,
         }),
     )
 }
 
-/// Wait for the child, killing it if the host hangs up first. Polls so that
-/// this thread alone owns the child: no other thread can reap it, so `kill`
-/// never hits a recycled pid.
+enum Waited {
+    Exited(std::process::ExitStatus),
+    /// Killed at the exec's deadline.
+    TimedOut(std::process::ExitStatus),
+    HungUp,
+}
+
+/// Wait for the child, killing it if the host hangs up or the deadline
+/// passes first. Polls so that this thread alone owns the child: no other
+/// thread can reap it, so `kill` never hits a recycled pid.
+///
+/// A hang-up is seen two ways: the reader thread reaches the end of the
+/// stream, or the connection itself reports it. The second covers a reader
+/// blocked on a full stdin queue, behind a child that does not read stdin.
+/// The deadline does not depend on the host at all: a hang-up can be held
+/// up on its way here behind queued input.
 fn wait_or_hangup(
     child: &mut Child,
     hangup: &AtomicBool,
-) -> io::Result<Option<std::process::ExitStatus>> {
+    conn: RawFd,
+    deadline: Option<Instant>,
+) -> io::Result<Waited> {
+    // The whole group: the command and anything it left running. The group
+    // cannot be reused while the child is unreaped.
+    let kill_group = |child: &mut Child| {
+        // SAFETY: kill with a negative pid signals the process group.
+        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+        child.wait()
+    };
     loop {
         if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
+            return Ok(Waited::Exited(status));
         }
-        if hangup.load(Ordering::Relaxed) {
-            // The whole group: the command and anything it left running. The
-            // group cannot be reused while the child is unreaped.
-            // SAFETY: kill with a negative pid signals the process group.
-            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-            let _ = child.wait();
-            return Ok(None);
+        if hangup.load(Ordering::Relaxed) || peer_gone(conn) {
+            let _ = kill_group(child);
+            return Ok(Waited::HungUp);
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Ok(Waited::TimedOut(kill_group(child)?));
         }
         thread::sleep(POLL);
     }
@@ -235,10 +261,8 @@ fn spawn_reader(mut reader: File, stdin_tx: mpsc::SyncSender<Vec<u8>>, hangup: A
                     }
                 }
                 Ok(Some(Frame::Stdin(_))) => {} // input after the child stopped reading
-                // Known limit: while blocked on a full queue (a live child
-                // that is not reading stdin) a hang-up is not seen until the
-                // child exits. The host destroys the VM in M0; M1 replaces
-                // this with poll(2).
+                // While this thread is blocked on a full queue, the waiter
+                // sees a hang-up on the connection itself (`peer_gone`).
                 // End of stream, an error, or anything unexpected: the host
                 // is gone or broken. Either way the exchange is over.
                 _ => {
@@ -248,6 +272,20 @@ fn spawn_reader(mut reader: File, stdin_tx: mpsc::SyncSender<Vec<u8>>, hangup: A
             }
         }
     });
+}
+
+/// Whether the host has shut its side of the connection, without reading.
+fn peer_gone(fd: RawFd) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLRDHUP,
+        revents: 0,
+    };
+    // SAFETY: poll on a descriptor this exchange owns, with a zero timeout.
+    unsafe {
+        libc::poll(&mut pfd, 1, 0) > 0
+            && pfd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0
+    }
 }
 
 /// Feed the child's stdin until the reader signals end of input. A child that

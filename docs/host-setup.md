@@ -127,7 +127,34 @@ and builds the pinned libkrun with block and network devices into
 ```sh
 rustup target add "$(uname -m)-unknown-linux-musl"
 scripts/m1-smoke.sh
+scripts/m1-api-smoke.sh
 ```
+
+### 4.2 Run the host agent
+
+```sh
+cargo build --release -p sandpiperd -p sandpiper-vmm
+sudo install -m 0755 target/release/sandpiperd target/release/sandpiper-vmm /usr/local/bin/
+sudo install -D -m 0644 target/m1/base.img /var/lib/sandpiper/templates/base.img
+sudo install -m 0644 packaging/sandpiperd.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now sandpiperd
+```
+
+The API listens on `127.0.0.1:7171`. Its token is in
+`/var/lib/sandpiper/token` (root only). Try it:
+
+```sh
+T=$(sudo cat /var/lib/sandpiper/token)
+curl -s -H "Authorization: Bearer $T" -d '{"template":"base"}' \
+  -H 'Content-Type: application/json' http://127.0.0.1:7171/v1/machines
+curl -s -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  -d '{"cmd":["uname","-a"]}' http://127.0.0.1:7171/v1/machines/<id>/exec
+```
+
+The exec reply is a stream of events, one JSON object per line; output is
+base64 in `data`. Each stream of one exec keeps its first 1 MiB. A machine
+may put 64 MiB of output into the event log in all; past that it is
+stopped.
 
 ## 5. Give the agent SSH access (run on your Mac)
 
