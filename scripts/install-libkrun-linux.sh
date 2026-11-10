@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Install the pinned libkrunfw (prebuilt, checksum-verified) and libkrun
 # (built from source, with block and network devices) into /usr/local.
-# Linux only; needs sudo, a Rust toolchain and build-essential.
+# Linux only; needs sudo, a Rust toolchain, build-essential and libclang-dev
+# (libkrun's build generates bindings with it).
 set -euo pipefail
 
 LIBKRUNFW_VERSION=v5.6.2

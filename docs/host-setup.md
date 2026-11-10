@@ -47,7 +47,7 @@ tools in the VM:
 
 ```sh
 limactl shell sandpiper-dev bash -lc '
-  sudo apt-get update && sudo apt-get install -y build-essential pkg-config git curl nftables
+  sudo apt-get update && sudo apt-get install -y build-essential pkg-config git curl nftables e2fsprogs libclang-dev rsync
   curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal'
 ```
 
@@ -115,7 +115,7 @@ sudo.
 From a checkout of this repository, on the box:
 
 ```sh
-sudo apt-get install -y build-essential pkg-config git curl e2fsprogs
+sudo apt-get install -y build-essential pkg-config git curl e2fsprogs libclang-dev
 curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 scripts/install-libkrun-linux.sh
 ```

@@ -48,6 +48,7 @@ jobs:
       - name: Build libkrun
         if: steps.krun.outputs.cache-hit != 'true'
         run: |
+          sudo apt-get install -y -qq libclang-dev
           git clone -q --depth 1 -b "$LIBKRUN_VERSION" https://github.com/containers/libkrun.git /tmp/libkrun
           make -C /tmp/libkrun BLK=1 NET=1 -j"$(nproc)"
           make -C /tmp/libkrun BLK=1 NET=1 install PREFIX="$HOME/krun"
