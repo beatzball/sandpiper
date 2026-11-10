@@ -46,7 +46,7 @@ Section numbers (§) point to `DESIGN.md`.
 | Replace the guest agent or init through a template build | **Blocked** | The platform adds the guest agent and init on a read-only layer after the build, and the template signature covers it (§4.4, §12). | M3 |
 | Use up CPU, memory, disk space or disk I/O | **Narrowed, not closed** | cgroup limits on CPU, memory and I/O, and a disk size per machine (§4.2). Neighbours on the same host can still slow down. | M1 |
 | Fork-bomb inside the guest | **Kept inside** | The `pids` limit is enforced in the guest (§4.2). A guest-kernel root can lift it, but then only that machine's CPU and memory, which cgroups cap, are spent. | M2 |
-| Keep a machine alive forever | **Blocked** | Idle and max TTL (§5) and an exec timeout (`execMaxMs`, §7) are enforced by the host. Guest clock changes do not affect them. | M1 |
+| Keep a machine alive forever | **Blocked** | Idle and max TTL (§5) and an exec timeout (`execMaxMs`, §7) are enforced by the host. Guest clock changes do not affect them. A dev box pauses idle TTL while a terminal is attached; its machine max time and box max age still apply (§11.5). | M1 |
 | Flood the host with output, events or audit records | **Narrowed, not closed** | Output is capped per exec, frames at 1 MiB (§4.4). Guest-caused audit records are rate-limited and each machine has a spool quota; hitting either stops the machine (§4.2). | M1 |
 | Predict another machine's random numbers | **Narrowed, not closed** | The host passes a fresh seed into the kernel's pool at every boot, and memory clones get a new VM generation ID (§4.4, §10). Random state a program saved on disk is copied into every branch; templates ship no persistent identities (§4.4). | M1 |
 
@@ -82,11 +82,12 @@ allowed hosts are listed separately and are not closed.
 | Make the upstream echo the key back (an endpoint that returns request headers) | **Narrowed, not closed** | Grants name narrow, reviewed endpoints. Once the key reaches the upstream, the upstream decides (§8, trust limit). | M3 |
 | Follow a redirect to carry the key to another host | **Blocked** | The proxy does not follow redirects on credentialed requests (§8). | M3 |
 | Mint a new credential that works without the proxy (add an SSH key, a deploy key, a webhook; mint a short-lived token) | **Narrowed, not closed** | The operator must state the credential cannot mint credentials. A deny list of known minting endpoints is the second layer. Single-endpoint APIs (GraphQL, batch) cannot be granted (§8.9). | M3 |
-| Reuse an old machine's placeholder found in a restored disk branch | **Blocked** | Placeholders are bound to their machine and grant; a branch gets new ones (§8, §10). | M3 |
+| Reuse an old machine's placeholder found in a restored disk branch | **Blocked** | Placeholders are bound to their machine and grant; a branch gets new ones (§8, §10). Each dev box session is a new machine with new ones (§11.5). | M3 |
 | Steal the proxy's CA key to forge certificates for other machines | **Narrowed, not closed** | One CA per machine, name-constrained to that machine's hosts, held only in proxy memory. A compromised proxy still reaches every machine on its host (§8). | M2 |
 | Read keys from the proxy through a CPU side channel | **Narrowed, not closed** | CPU mitigations on, SMT off, microcode current on `untrusted` hosts (§12). The proxy still shares CPUs with untrusted machines. | M2 |
 | Keep using a key after it is revoked | **Narrowed, not closed** | Revocations are pushed at once; cached secrets expire within 60 seconds (§8). | M3 |
 | Pin certificates to detect the proxy and refuse to work | **Kept inside** | Pinned clients fail closed. Nothing leaks (§8). | M2 |
+| Use a stolen project key to enter a dev box | **Narrowed, not closed** | Every route to a box, its machine or its snapshots needs the `devbox` scope; a key made for machines alone cannot reach them (§4.1, §11.5). A stolen key with that scope can. | M3.5 |
 | Steal a control-plane API key that a caller put into a machine | **Left to you** | Placeholders protect only grants (§8), not the platform's own API keys. Never pass an API key into a machine. Scopes limit what a stolen key can do (§4.1). | — |
 
 ## 4. Hiding what was done
@@ -104,16 +105,19 @@ allowed hosts are listed separately and are not closed.
 |---|---|---|---|
 | Plant a hook, filter or config in a repo that runs on the host when work is fetched | **Blocked** | Work leaves as a git bundle. The host fetches it in a jailed process into a fresh scratch repo, with `fsckObjects` on and one explicit refspec (§11.3). | M2 |
 | Send a hostile pack to exploit or exhaust the host's git | **Narrowed, not closed** | The fetch process is unprivileged, with no network, no host secrets, and CPU, memory, time and size caps (§11.3). A jail escape needs a further bug. | M2 |
+| Attack the host's git through a repository fetched into a dev box | **Narrowed, not closed** | Only repositories on the project's list are fetched, by a jailed helper with network to one git host, caps, a fresh bare repository and no checkout (§11.5). A bug in git itself still lands in that jail. | M3.5 |
 | Plant symlinks, submodules or `.gitattributes` filters that act on checkout | **Kept inside** | Fetched work is checked out or merged inside a machine, never in an operator checkout (§11.3). | M2 |
 | Put a backdoor, a changed CI config or an install script in the work itself | **Left to you** | The platform moves the work safely; it cannot judge it. Review before merge, and run CI for that branch in a machine, not on a trusted runner. | — |
 | Write instructions in exec output to steer the calling agent | **Left to you** | Exec output goes back to the caller's model (§11.1). Treat it as untrusted input. The caller's API key should carry no service or promotion scope (§4.1). | — |
 | Print terminal control codes in error messages or console output | **Blocked** | The VMM wrapper cuts and escapes guest text before it prints it (M0 `sanitize`). Blocked host names are escaped too (§7.3, M2). | M0 |
+| Send terminal control codes through a dev box terminal (read the clipboard, fake links, answer terminal queries) | **Narrowed, not closed** | The PTY endpoint drops clipboard, hyperlink, query and device-control sequences for every client. Other sequences pass, because a terminal needs them (§11.5). | M3.5 |
+| Catch a real secret the operator types or pastes into a dev box terminal | **Left to you** | What is typed into the box is inside the box. Use grants, never paste keys (§8). | — |
 | Print terminal control codes in a command's stdout or stderr | **Left to you** | Command output is the program's own bytes and passes through unchanged. Escape it before showing it in a terminal or a web page. | — |
 | Ship malicious code in a template that a build produced | **Left to you** | A template signature means "this control plane approved these bytes", not "this software is safe". Builds run in untrusted machines (§12). | — |
 | Install a malicious package during a run | **Narrowed, not closed** | It runs in the machine like any other code, so the walls hold. It can still use the machine's grants and send data through its allowed hosts. | M1 |
 | Swap a template on the registry or host disk | **Blocked** | The host agent checks the template's signature and content hash before boot (§12). | M3 |
 | Swap a host binary in a release | **Blocked** | Binaries are verified against a release key pinned at install (§12). | M2 |
-| Keep sensitive data in a pinned snapshot after the machine is gone | **Left to you** | Pinned snapshots outlive their machine (§10). They hold no platform keys, but may hold the work's own data. Unpin what is not needed. | M3 |
+| Keep sensitive data in a pinned snapshot after the machine is gone | **Left to you** | Pinned snapshots outlive their machine (§10). So does a dev box's last snapshot, until the box is destroyed (§11.5). They hold no platform keys, but may hold the work's own data. Unpin what is not needed. | M3 |
 
 ## 6. Machines attacking each other, and production
 
@@ -122,6 +126,7 @@ allowed hosts are listed separately and are not closed.
 | One machine reaches another over the network | **Blocked** | No route between machines (§7.3). | M1 |
 | Read another machine's data through a CPU side channel | **Narrowed, not closed** | CPU mitigations on, SMT off, microcode current (§12). Machines still share hardware. | M1 |
 | A process in one exec spies on another exec in the same machine | **Narrowed, not closed** | Per-exec confinement is defence in depth, not a trust boundary. Work at different trust levels runs in separate machines (§7.2). | M2 |
+| Plant something in a dev box that runs in the next session, such as the agent's own hooks or tool settings | **Narrowed, not closed** | A dev box's disk is kept between sessions, so a planted file survives and runs with the next session's grants. It stays inside the one box, and the box is destroyed at its max age (§11.5). | M3.5 |
 | Untrusted code shares a host with a production service | **Blocked** | `untrusted` and `services` pools are on separate hosts (§3, §12). | M4 |
 | Get code an untrusted agent built promoted to a service | **Left to you** | Promotion needs its own scope, and the template is rebuilt for the `services` pool (§4.1, §11.4). A person decides what is promoted. | M4 |
 | Call a production service's public endpoint from a machine | **Blocked** for this platform's services; **Left to you** for others | The edge proxy's addresses are on the deny list (§7.3). A service hosted elsewhere can be called like any allowed host; keep it off allowlists unless needed. | M2 |
