@@ -122,11 +122,20 @@ pub fn enter(
         // The child cannot use getppid() to see whether the supervisor is
         // still there: across a PID namespace it always reads 0.
         os(libc::pipe2(alive.as_mut_ptr(), libc::O_CLOEXEC))?;
+        // Block every signal across the fork, so none can kill the
+        // supervisor before it is listening for them. The child restores
+        // the old mask at once.
+        let mut all: libc::sigset_t = std::mem::zeroed();
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut all);
+        libc::sigprocmask(libc::SIG_BLOCK, &all, &mut old);
+        let driver = libc::getppid();
         let pid = os(libc::fork())?;
         if pid > 0 {
             libc::close(alive[0]);
-            supervise(pid, lifeline);
+            supervise(pid, driver, lifeline, &all);
         }
+        libc::sigprocmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
         libc::close(alive[1]);
         // Covers the window until libkrun's uid switch, which clears it.
         os(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0))?;
@@ -223,30 +232,49 @@ pub fn enter(
     Ok(alive)
 }
 
+/// The processes a supervisor started: its VMM, the init of the machine's
+/// PID namespace. While the supervisor lives (even stopped) it has not
+/// reaped them, so their pids cannot have been reused.
+pub fn children_of(supervisor: u32) -> Vec<libc::pid_t> {
+    fs::read_to_string(format!("/proc/{supervisor}/task/{supervisor}/children"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|p| p.parse().ok())
+        .collect()
+}
+
 /// The supervisor: stays root and outside the PID namespace (it shares the
 /// others, and the jail's root), and kills the machine — the whole PID
 /// namespace, by SIGKILL to its init — when the driver says so or is gone:
 ///
-/// - SIGTERM, SIGINT or SIGHUP;
+/// - any signal that would by default end a process (every signal is
+///   blocked and read from a signalfd, so none can end the supervisor
+///   first; only SIGKILL and SIGSTOP cannot be caught);
 /// - the driver's death (`PR_SET_PDEATHSIG`, delivered as SIGTERM; the
-///   supervisor never changes uid, so the kernel keeps it armed);
+///   supervisor never changes uid, so the kernel keeps it armed). It fires
+///   when the driver *thread* that spawned `boot` exits, so a driver must
+///   spawn from a thread that lives as long as the machine;
 /// - with `lifeline`, end of stdin.
 ///
-/// None of this needs the VMM's cooperation. Exits with the VMM's status.
-fn supervise(child: libc::pid_t, lifeline: bool) -> ! {
-    // SAFETY: signal-mask, signalfd, pidfd and poll calls on descriptors
-    // made here; the process is single-threaded.
+/// None of this needs the VMM's cooperation. A SIGKILL to the supervisor
+/// itself still leaves only the VMM's own threads to end the machine; the
+/// host agent (M1 part 2) adds a cgroup and `cgroup.kill` as the final stop.
+/// Exits with the VMM's status.
+fn supervise(
+    child: libc::pid_t,
+    driver: libc::pid_t,
+    lifeline: bool,
+    signals: &libc::sigset_t,
+) -> ! {
+    // SAFETY: signalfd, pidfd, poll and read calls on descriptors made
+    // here; the process is single-threaded and all signals are blocked.
     unsafe {
-        let mut mask: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut mask);
-        for s in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-            libc::sigaddset(&mut mask, s);
-        }
-        libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
-        let sfd = libc::signalfd(-1, &mask, libc::SFD_CLOEXEC);
+        let sfd = libc::signalfd(-1, signals, libc::SFD_CLOEXEC);
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
         let pidfd = libc::syscall(libc::SYS_pidfd_open, child, 0) as libc::c_int;
-        if sfd < 0 || pidfd < 0 {
+        if sfd < 0 || pidfd < 0 || libc::getppid() != driver {
+            // No way to watch, or the driver died before the death signal
+            // was armed: the machine goes now.
             libc::kill(child, libc::SIGKILL);
         } else {
             let mut fds = [
@@ -278,8 +306,17 @@ fn supervise(child: libc::pid_t, lifeline: bool) -> ! {
                     break; // the VMM exited by itself
                 }
                 if fds[1].revents != 0 {
-                    libc::kill(child, libc::SIGKILL);
-                    break;
+                    let mut info: libc::signalfd_siginfo = std::mem::zeroed();
+                    let size = std::mem::size_of::<libc::signalfd_siginfo>();
+                    let n =
+                        libc::read(sfd, (&mut info as *mut libc::signalfd_siginfo).cast(), size);
+                    let harmless = n as usize == size
+                        && [libc::SIGCHLD, libc::SIGCONT, libc::SIGWINCH, libc::SIGURG]
+                            .contains(&(info.ssi_signo as libc::c_int));
+                    if !harmless {
+                        libc::kill(child, libc::SIGKILL);
+                        break;
+                    }
                 }
                 if fds[2].revents != 0 {
                     let mut buf = [0u8; 64];
@@ -474,6 +511,23 @@ pub fn probe_walls(uid: u32, gid: u32) -> i32 {
                     std::ptr::null(),
                 ) != 0,
             ),
+            // Unprivileged processes may make these by default, so only the
+            // filter refuses them.
+            ("userfaultfd", {
+                let fd = libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | 1); // UFFD_USER_MODE_ONLY
+                if fd >= 0 {
+                    libc::close(fd as i32);
+                }
+                fd < 0
+            }),
+            ("io_uring", {
+                let mut params = [0u8; 120];
+                let fd = libc::syscall(libc::SYS_io_uring_setup, 1, params.as_mut_ptr());
+                if fd >= 0 {
+                    libc::close(fd as i32);
+                }
+                fd < 0
+            }),
             ("host-files", fs::metadata("/etc/passwd").is_err()),
             ("root-readonly", fs::File::create("/probe").is_err()),
             ("uid", libc::geteuid() != 0 && libc::getegid() != 0),

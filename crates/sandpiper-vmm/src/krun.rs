@@ -94,8 +94,9 @@ pub struct VmConfig<'a> {
     /// Passed explicitly: a NULL envp would copy the host environment
     /// (home directory, user name) into the guest.
     pub env: &'a [&'a str],
-    /// The unprivileged uid and gid libkrun switches to just before the
-    /// guest starts, after it has opened `/dev/kvm` and the disk.
+    /// The unprivileged uid and gid libkrun switches to inside
+    /// `krun_start_enter`, before it opens `/dev/kvm` and the disk: both
+    /// must be usable by this uid.
     pub run_as: Option<(u32, u32)>,
     /// Runs last, after libkrun is configured and before it takes over the
     /// process. The sandbox installs its seccomp filter here.

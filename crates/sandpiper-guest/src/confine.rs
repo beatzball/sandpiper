@@ -24,8 +24,11 @@ pub const WORKLOAD_GID: u32 = 1000;
 /// - no namespaces: a user namespace would hand a workload capabilities
 ///   over new network and mount namespaces, and with them a large kernel
 ///   surface (netfilter, netlink) to climb to guest root from;
-/// - no `ptrace` or `process_vm_*`: a workload left running by one exec
-///   cannot reach into a later one.
+/// - no `ptrace` or `process_vm_*`. This narrows, but does not stop, a
+///   workload left running by one exec from reaching a later one: they
+///   share a uid, so `/proc/<pid>/mem`, `pidfd_getfd` and signals still
+///   work. Work at different trust levels runs in separate machines
+///   (DESIGN.md §7.2).
 ///
 /// Everything else is allowed; M2's in-guest confinement narrows further.
 pub fn workload_filter() -> Vec<libc::sock_filter> {

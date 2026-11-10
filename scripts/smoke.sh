@@ -92,7 +92,7 @@ if [ "$MODE" = m1 ]; then
 
   # The VMM's walls from inside: in the jail, as its uid, under its filter.
   probe=$("$V" run "${ROOT[@]}" --probe 2>&1)
-  for wall in vsock userns clone-userns ptrace mount host-files root-readonly uid; do
+  for wall in vsock userns clone-userns ptrace mount userfaultfd io_uring host-files root-readonly uid; do
     check "jailed VMM: $wall" "$wall blocked" "$(grep "^$wall " <<<"$probe")"
   done
 
@@ -107,10 +107,13 @@ if [ "$MODE" = m1 ]; then
     [ -n "$vmm" ] && break
     sleep 0.1
   done
-  kill -STOP "$vmm"
-  kill -9 "$driver"; wait "$driver" 2>/dev/null
-  sleep 1
-  check "an uncooperative VMM dies with its driver" "gone" "$(kill -0 "$vmm" 2>/dev/null && echo alive || echo gone)"
+  check "found the VMM to stop" "1" "$([ -n "$vmm" ] && echo 1 || echo 0)"
+  if [ -n "$vmm" ]; then
+    kill -STOP "$vmm"
+    kill -9 "$driver"; wait "$driver" 2>/dev/null
+    sleep 1
+    check "an uncooperative VMM dies with its driver" "gone" "$(kill -0 "$vmm" 2>/dev/null && echo alive || echo gone)"
+  fi
 fi
 
 check "no leftover VMMs" "" "$(pgrep -f 'sandpiper-vmm boot')"

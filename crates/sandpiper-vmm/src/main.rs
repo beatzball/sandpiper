@@ -193,6 +193,11 @@ fn boot(o: &Opts) -> io::Result<std::convert::Infallible> {
     let run_as = match (&o.jail, o.uid, o.gid) {
         (None, None, None) => None,
         (Some(jail), Some(uid), Some(gid)) => {
+            if !o.die_with_parent && !o.probe {
+                return Err(io::Error::other(
+                    "a sandboxed VMM needs --die-with-parent (its supervisor's lifeline)",
+                ));
+            }
             if uid < MIN_SANDBOX_ID || gid < MIN_SANDBOX_ID {
                 return Err(io::Error::other(format!(
                     "a sandboxed VMM's uid and gid must be at least {MIN_SANDBOX_ID}"
@@ -464,6 +469,14 @@ fn stop(child: &mut Child) {
             return;
         }
         thread::sleep(Duration::from_millis(20));
+    }
+    // The supervisor did not act (stopped, or not a sandboxed VMM). Kill
+    // what it started before the supervisor itself, so the machine never
+    // outlives the one process that could still kill it.
+    #[cfg(target_os = "linux")]
+    for pid in sandbox::children_of(child.id()) {
+        // SAFETY: an unreaped child of a live supervisor; see children_of.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
     }
     let _ = child.kill();
 }
