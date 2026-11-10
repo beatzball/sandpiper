@@ -168,7 +168,13 @@ fn run(o: Opts) -> io::Result<()> {
         // streams still open, so the server can then drain.
         eprintln!("sandpiperd: stopping; destroying every machine");
         let m = Arc::clone(&mgr);
-        let _ = tokio::task::spawn_blocking(move || m.destroy_all("host agent stopping")).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            m.destroy_all("host agent stopping");
+            if !m.wait_empty(Duration::from_secs(15)) {
+                eprintln!("sandpiperd: some machines were still stopping at exit");
+            }
+        })
+        .await;
         let _ = drain_tx.send(());
         if tokio::time::timeout(Duration::from_secs(5), server)
             .await

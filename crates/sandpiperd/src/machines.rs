@@ -217,7 +217,8 @@ pub struct Manager {
     slots: Mutex<BTreeSet<u32>>,
     /// Machines whose cgroup could not be emptied: their uid is not handed
     /// out again until it is.
-    quarantine: Mutex<Vec<(u32, CgroupGroup)>>,
+    /// Each with the slots it holds, which may be none.
+    quarantine: Mutex<Vec<(Vec<u32>, CgroupGroup)>>,
     spawner: Spawner,
     /// Set at shutdown: no new machines or execs.
     stopping: AtomicBool,
@@ -277,10 +278,9 @@ impl Manager {
                 eprintln!(
                     "sandpiperd: a leftover machine cgroup keeps processes; slots {mine:?} wait for it"
                 );
-                for slot in mine {
-                    slots.insert(slot);
-                    quarantine.push((slot, g.clone()));
-                }
+                slots.extend(&mine);
+                // Kept even with no slot, so the reaper goes on removing it.
+                quarantine.push((mine, g));
             }
             Some(root)
         } else {
@@ -913,6 +913,21 @@ impl Manager {
         Ok(())
     }
 
+    /// Wait until no machine is left and no create is in progress, or the
+    /// timeout passes. For shutdown, after [`Self::destroy_all`]: a create
+    /// that finished late tears its machine down on its own thread.
+    pub fn wait_empty(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let empty = self.machines.lock().expect("machines lock").is_empty()
+                && self.creating.load(Ordering::SeqCst) == 0;
+            if empty || Instant::now() >= deadline {
+                return empty;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Refuse new machines and execs, wait for creates in progress, then
     /// destroy every machine. For shutdown.
     pub fn destroy_all(&self, reason: &str) {
@@ -1013,7 +1028,7 @@ impl Manager {
             self.quarantine
                 .lock()
                 .expect("quarantine lock")
-                .push((m.slot, g.clone()));
+                .push((vec![m.slot], g.clone()));
         }
         if let Some(console) = console
             && !console.is_empty()
@@ -1076,10 +1091,12 @@ impl Manager {
             }
         });
         let mut q = self.quarantine.lock().expect("quarantine lock");
-        q.retain(|(slot, g)| {
+        q.retain(|(slots, g)| {
             kill_group(g);
             if remove_group(g) {
-                self.free_slot(*slot);
+                for slot in slots {
+                    self.free_slot(*slot);
+                }
                 false
             } else {
                 true
