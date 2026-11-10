@@ -1,9 +1,17 @@
 //! `sandpiper-vmm` — one microVM per process (DESIGN.md §4.2).
 //!
 //! ```text
-//! sandpiper-vmm boot --root DIR --socket PATH [--cpus N] [--mem MIB] [--die-with-parent]
-//! sandpiper-vmm run  --root DIR [--cpus N] [--mem MIB] [--timeout SECS] [--stdin] [--time] -- CMD [ARGS...]
+//! sandpiper-vmm boot (--root DIR | --disk IMAGE) --socket PATH [--cpus N] [--mem MIB]
+//!                    [--die-with-parent] [--jail DIR --uid N --gid N]
+//! sandpiper-vmm run  (--root DIR | --disk IMAGE) [--cpus N] [--mem MIB] [--timeout SECS]
+//!                    [--stdin] [--time] -- CMD [ARGS...]
 //! ```
+//!
+//! `--disk` boots from an ext4 image; `run` gives each machine its own copy.
+//! On Linux, `run` as root sandboxes the VMM (see `sandbox`): its own
+//! namespaces and uid, only its machine's files, a seccomp filter. Without
+//! root it warns and runs unsandboxed, for development; setting
+//! `SANDPIPER_UNSANDBOXED=1` acknowledges that and silences the warning.
 //!
 //! `boot` enters the VM and never returns. `run` is the M0 driver: it starts
 //! a `boot` child, connects to the guest agent, runs one command, prints its
@@ -15,6 +23,8 @@
 //! apart.
 
 mod krun;
+#[cfg(target_os = "linux")]
+mod sandbox;
 
 use std::collections::VecDeque;
 use std::fs;
@@ -48,6 +58,10 @@ const EXIT_SANDPIPER: u8 = 125;
 
 struct Opts {
     root: Option<String>,
+    disk: Option<String>,
+    jail: Option<String>,
+    uid: Option<u32>,
+    gid: Option<u32>,
     socket: Option<String>,
     cpus: u8,
     mem: u32,
@@ -61,6 +75,10 @@ struct Opts {
 fn parse(args: &[String]) -> Result<Opts, String> {
     let mut o = Opts {
         root: None,
+        disk: None,
+        jail: None,
+        uid: None,
+        gid: None,
         socket: None,
         cpus: 1,
         mem: 512,
@@ -75,6 +93,22 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         let mut val = |name: &str| it.next().cloned().ok_or(format!("{name} needs a value"));
         match a.as_str() {
             "--root" => o.root = Some(val("--root")?),
+            "--disk" => o.disk = Some(val("--disk")?),
+            "--jail" => o.jail = Some(val("--jail")?),
+            "--uid" => {
+                o.uid = Some(
+                    val("--uid")?
+                        .parse()
+                        .map_err(|_| "--uid must be a number")?,
+                )
+            }
+            "--gid" => {
+                o.gid = Some(
+                    val("--gid")?
+                        .parse()
+                        .map_err(|_| "--gid must be a number")?,
+                )
+            }
             "--socket" => o.socket = Some(val("--socket")?),
             "--cpus" => {
                 o.cpus = val("--cpus")?
@@ -130,10 +164,11 @@ fn main() -> ExitCode {
 fn usage(err: &str) -> ExitCode {
     eprintln!("sandpiper-vmm: {err}");
     eprintln!(
-        "usage: sandpiper-vmm boot --root DIR --socket PATH [--cpus N] [--mem MIB] [--die-with-parent]"
+        "usage: sandpiper-vmm boot (--root DIR | --disk IMAGE) --socket PATH [--cpus N] [--mem MIB]"
     );
+    eprintln!("                          [--die-with-parent] [--jail DIR --uid N --gid N]");
     eprintln!(
-        "       sandpiper-vmm run --root DIR [--timeout SECS] [--stdin] [--time] -- CMD [ARGS...]"
+        "       sandpiper-vmm run (--root DIR | --disk IMAGE) [--timeout SECS] [--stdin] [--time] -- CMD [ARGS...]"
     );
     ExitCode::from(2)
 }
@@ -144,6 +179,17 @@ fn need<'a>(v: &'a Option<String>, name: &str) -> io::Result<&'a str> {
 }
 
 fn boot(o: &Opts) -> io::Result<std::convert::Infallible> {
+    let mut socket = need(&o.socket, "--socket")?.to_owned();
+    let mut disk = o.disk.clone();
+    let run_as = match (&o.jail, o.uid, o.gid) {
+        (None, None, None) => None,
+        (Some(jail), Some(uid), Some(gid)) => {
+            enter_jail(Path::new(jail), &mut socket, &mut disk, uid, gid)?;
+            Some((uid, gid))
+        }
+        _ => return Err(io::Error::other("--jail, --uid and --gid go together")),
+    };
+    // Threads start only after the jail is entered: it forks.
     if o.die_with_parent {
         // The parent holds the write end of our stdin. However the parent
         // ends — even SIGKILL — the pipe closes and the machine goes with it.
@@ -168,15 +214,107 @@ fn boot(o: &Opts) -> io::Result<std::convert::Infallible> {
             std::process::exit(EXIT_SANDPIPER.into());
         });
     }
+    let root = match (&o.root, &disk) {
+        (Some(dir), None) => krun::Root::Dir(dir),
+        (None, Some(image)) => krun::Root::Disk(image),
+        _ => return Err(io::Error::other("give exactly one of --root and --disk")),
+    };
     krun::boot(&krun::VmConfig {
-        root: need(&o.root, "--root")?,
+        root,
         vcpus: o.cpus,
         ram_mib: o.mem,
-        socket: need(&o.socket, "--socket")?,
+        socket: &socket,
         guest_port: GUEST_PORT,
         exec_path: GUEST_AGENT,
         env: GUEST_ENV,
+        run_as,
+        before_enter: &|| before_enter(run_as.is_some()),
     })
+}
+
+/// Enter the sandbox and rewrite the machine's paths to where they appear
+/// inside it. The socket and disk must both live in `<jail>/machine`.
+#[cfg(target_os = "linux")]
+fn enter_jail(
+    jail: &Path,
+    socket: &mut String,
+    disk: &mut Option<String>,
+    uid: u32,
+    gid: u32,
+) -> io::Result<()> {
+    let machine = jail.join("machine");
+    let inside = |p: &str| -> io::Result<String> {
+        let rest = Path::new(p)
+            .strip_prefix(&machine)
+            .map_err(|_| io::Error::other(format!("{p} is not under {}", machine.display())))?;
+        Ok(Path::new(sandbox::MACHINE_DIR)
+            .join(rest)
+            .to_string_lossy()
+            .into_owned())
+    };
+    let new_socket = inside(socket)?;
+    let new_disk = disk.as_deref().map(inside).transpose()?;
+    let alive = sandbox::enter(jail, &machine, uid, gid)?;
+    thread::spawn(move || sandbox::exit_with_parent(alive));
+    *socket = new_socket;
+    *disk = new_disk;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enter_jail(_: &Path, _: &mut String, _: &mut Option<String>, _: u32, _: u32) -> io::Result<()> {
+    Err(io::Error::other("the VMM sandbox needs Linux"))
+}
+
+#[cfg(target_os = "linux")]
+fn before_enter(jailed: bool) -> io::Result<()> {
+    if jailed {
+        sandbox::drop_groups()?;
+        sandbox::install_filter(&sandbox::vmm_filter())?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn before_enter(_: bool) -> io::Result<()> {
+    Ok(())
+}
+
+/// Copy a disk image, sharing blocks with the original where the filesystem
+/// allows it (reflink), so a copy is cheap on XFS and btrfs.
+fn copy_image(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let src = fs::File::open(from)?;
+        let dst = fs::File::create(to)?;
+        // SAFETY: FICLONE on two open files; failure falls back to a copy.
+        let rc = unsafe {
+            libc::ioctl(
+                std::os::fd::AsRawFd::as_raw_fd(&dst),
+                libc::FICLONE,
+                std::os::fd::AsRawFd::as_raw_fd(&src),
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+    }
+    fs::copy(from, to).map(drop)
+}
+
+/// Give a machine directory and everything in it to the machine's uid.
+#[cfg(target_os = "linux")]
+fn chown_tree(dir: &Path, id: u32) -> io::Result<()> {
+    std::os::unix::fs::chown(dir, Some(id), Some(id))?;
+    for entry in fs::read_dir(dir)? {
+        std::os::unix::fs::chown(entry?.path(), Some(id), Some(id))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn chown_tree(_: &Path, _: u32) -> io::Result<()> {
+    Ok(())
 }
 
 /// A private scratch directory for one machine's socket, removed on drop.
@@ -318,20 +456,52 @@ enum Outcome {
     TimedOut,
 }
 
+/// Whether `run` can sandbox the VMM here: Linux, as root.
+fn can_sandbox() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    cfg!(target_os = "linux") && unsafe { libc::geteuid() } == 0
+}
+
 fn run(o: &Opts) -> io::Result<ExitCode> {
     if o.argv.is_empty() {
         return Err(io::Error::other("no command given after --"));
     }
-    let root = fs::canonicalize(need(&o.root, "--root")?)?;
     let scratch = Scratch::new()?;
-    let socket = scratch.0.join("agent.sock");
+    let machine = scratch.0.join("machine");
+    fs::DirBuilder::new().mode(0o700).create(&machine)?;
+    let socket = machine.join("agent.sock");
 
     let started = Instant::now();
+    let mut boot = Command::new(std::env::current_exe()?);
+    boot.arg("boot");
+    match (&o.root, &o.disk) {
+        (Some(dir), None) => {
+            boot.arg("--root").arg(fs::canonicalize(dir)?);
+        }
+        (None, Some(image)) => {
+            // Each machine writes to its own copy; the base image stays clean.
+            let copy = machine.join("root.img");
+            copy_image(Path::new(image), &copy)?;
+            boot.arg("--disk").arg(copy);
+        }
+        _ => return Err(io::Error::other("give exactly one of --root and --disk")),
+    }
+    if can_sandbox() {
+        // One uid per machine; the host agent allocates these from M1 on.
+        let id = 200_000 + std::process::id() % 100_000;
+        chown_tree(&machine, id)?;
+        boot.arg("--jail").arg(&scratch.0).args([
+            "--uid",
+            &id.to_string(),
+            "--gid",
+            &id.to_string(),
+        ]);
+    } else if cfg!(target_os = "linux") && std::env::var_os("SANDPIPER_UNSANDBOXED").is_none() {
+        // Set SANDPIPER_UNSANDBOXED=1 to say this is known and wanted.
+        eprintln!("sandpiper-vmm: not root, so the VMM is NOT sandboxed (development only)");
+    }
     let (lifeline_r, lifeline_w) = io::pipe()?;
-    let mut child = Command::new(std::env::current_exe()?)
-        .arg("boot")
-        .arg("--root")
-        .arg(&root)
+    let mut child = boot
         .arg("--socket")
         .arg(&socket)
         .args(["--cpus", &o.cpus.to_string(), "--mem", &o.mem.to_string()])

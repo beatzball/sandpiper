@@ -51,6 +51,12 @@ limactl shell sandpiper-dev bash -lc '
   curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal'
 ```
 
+Then install libkrun (section 4.1) inside the VM:
+
+```sh
+limactl shell sandpiper-dev bash -lc '. ~/.cargo/env && scripts/install-libkrun-linux.sh'
+```
+
 Stop it with `limactl stop sandpiper-dev` when you are not using it.
 
 The rest of this guide is for real Linux hosts.
@@ -103,6 +109,25 @@ Do not add `sandpiper` to the `kvm` group. It is the operator account and gets
 sudo in step 6. MicroVMs run under separate unprivileged users that the host
 agent creates (DESIGN.md §4.2), so a VM escape never lands in an account with
 sudo.
+
+### 4.1 Install libkrun
+
+From a checkout of this repository, on the box:
+
+```sh
+sudo apt-get install -y build-essential pkg-config git curl e2fsprogs
+curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+scripts/install-libkrun-linux.sh
+```
+
+The script installs a pinned, checksum-verified libkrunfw (the guest kernel)
+and builds the pinned libkrun with block and network devices into
+`/usr/local`. Then check the whole M1 stack:
+
+```sh
+rustup target add "$(uname -m)-unknown-linux-musl"
+scripts/m1-smoke.sh
+```
 
 ## 5. Give the agent SSH access (run on your Mac)
 

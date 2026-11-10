@@ -29,3 +29,31 @@ jobs:
             cargo build --release -p sandpiper-guest --target "$t"
           done
       - run: scripts/check-crate-pii.sh sandpiper
+
+  # Links and tests the VMM against a real libkrun. Runners have no KVM, so
+  # no VM boots here; scripts/m1-smoke.sh covers that on a KVM host.
+  vmm:
+    runs-on: ubuntu-latest
+    env:
+      LIBKRUN_VERSION: v1.19.7
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - uses: actions/cache@v4
+        id: krun
+        with:
+          path: ~/krun
+          key: libkrun-${{ env.LIBKRUN_VERSION }}-blk-net-${{ runner.os }}-${{ runner.arch }}
+      - name: Build libkrun
+        if: steps.krun.outputs.cache-hit != 'true'
+        run: |
+          git clone -q --depth 1 -b "$LIBKRUN_VERSION" https://github.com/containers/libkrun.git /tmp/libkrun
+          make -C /tmp/libkrun BLK=1 NET=1 -j"$(nproc)"
+          make -C /tmp/libkrun BLK=1 NET=1 install PREFIX="$HOME/krun"
+      - name: Build and test the VMM
+        run: |
+          libdir=$(dirname "$(find ~/krun -name 'libkrun.so' | head -1)")
+          export KRUN_LIB_DIR="$libdir" LD_LIBRARY_PATH="$libdir"
+          cargo clippy -p sandpiper-vmm --all-targets -- -D warnings
+          cargo test -p sandpiper-vmm

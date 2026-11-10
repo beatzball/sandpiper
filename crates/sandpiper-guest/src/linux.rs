@@ -1,13 +1,14 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::confine;
 use sandpiper_proto::{
     DEFAULT_OUTPUT_CAP, ExecRequest, ExitStatus, Frame, GUEST_PORT, PROTOCOL_VERSION, read_frame,
     write_frame,
@@ -26,6 +27,7 @@ const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/s
 type Writer = Arc<Mutex<File>>;
 
 pub fn serve() -> io::Result<()> {
+    confine::mix_host_entropy()?;
     let listener = vsock_listen(GUEST_PORT)?;
     loop {
         let conn = vsock_accept(&listener)?;
@@ -385,7 +387,15 @@ fn command(req: &ExecRequest) -> Command {
         .argv
         .split_first()
         .map_or(("", &[][..]), |(p, a)| (p.as_str(), a));
+    let filter = confine::workload_filter();
     let mut cmd = Command::new(program);
+    // std drops supplementary groups, then sets gid and uid, then runs the
+    // pre_exec hook, so the filter is installed by the unprivileged child.
+    cmd.uid(confine::WORKLOAD_UID).gid(confine::WORKLOAD_GID);
+    // SAFETY: `apply` makes only async-signal-safe calls (prctl).
+    unsafe {
+        cmd.pre_exec(move || confine::apply(&filter));
+    }
     cmd.args(args)
         .env_clear()
         .env("PATH", DEFAULT_PATH)

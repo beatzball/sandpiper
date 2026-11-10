@@ -2,16 +2,24 @@
 //!
 //! Binds the vsock port at boot, before any workload exists, then serves one
 //! exchange per connection. The host always connects in; this process never
-//! dials out.
-//!
-//! Not yet here (M1): dropping workloads to an unprivileged uid and the
-//! seccomp filter that keeps them off vsock.
+//! dials out. Workloads run unprivileged and cannot reach vsock (`confine`).
 
+#[cfg(target_os = "linux")]
+mod confine;
 #[cfg(target_os = "linux")]
 mod linux;
 
 #[cfg(target_os = "linux")]
 fn main() {
+    // `probe` runs as a workload (through exec) to test the walls from the
+    // inside; see `confine::probe`.
+    if let Some(what) = std::env::args()
+        .nth(1)
+        .filter(|a| a == "probe")
+        .and(std::env::args().nth(2))
+    {
+        std::process::exit(confine::probe(&what));
+    }
     if let Err(e) = linux::serve() {
         eprintln!("sandpiper-guest: {e}");
         std::process::exit(1);

@@ -41,5 +41,7 @@ if [ "$(uname -s)" = Darwin ]; then
   export DYLD_FALLBACK_LIBRARY_PATH="${DYLD_FALLBACK_LIBRARY_PATH:-$(brew --prefix)/lib:/usr/local/lib:/usr/lib}"
 fi
 
+# M0 is development only and never sandboxed (DESIGN.md §12).
+export SANDPIPER_UNSANDBOXED=1
 [ $# -eq 0 ] && set -- echo hello
 exec "$VMM" run --root "$ROOTFS" --time -- "$@"
