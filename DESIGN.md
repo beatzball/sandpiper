@@ -120,8 +120,8 @@ One binary. State in SQLite (replication later if needed). Responsibilities:
 - **Policy compiler** — merges the policy layers (§7.1) into one resolved
   policy per machine, and rejects any layer that tries to widen a parent.
 - **Authorization** — API keys carry scopes. Creating in the `untrusted` pool,
-  deploying a service, and promoting a machine to a service (§11.4) are three
-  separate scopes. A key can only touch its own project's machines.
+  deploying a service, promoting a machine to a service (§11.4), and using
+  dev boxes (§11.5) are four separate scopes. A key can only touch its own project's machines.
 - **Secret vault** — encrypted at rest. Hands secrets only to egress proxies,
   never to machines. Pushes revocations to proxies (§8).
 - **Event log** — every state change and its event are written in **one SQLite
@@ -325,9 +325,9 @@ another to the machine behind it. Two kinds of route:
 | Disk | discarded on destroy | persistent volume |
 | Pool | `untrusted` | `services` |
 
-A **dev box** (§11.5) is an `ephemeral` machine with a longer lifetime: its
-idle TTL pauses while a terminal is attached, and its disk is kept as a
-snapshot between sessions. It stays in `untrusted`.
+A **dev box** (§11.5) is a record that runs one `ephemeral` machine at a
+time, in `untrusted`. Its disk is kept as a snapshot between machines, and it
+has its own time limits.
 
 A **policy violation** that the host can observe (egress to a blocked domain
 repeated past a threshold, a resource limit breached) stops the machine and
@@ -358,11 +358,14 @@ POST   /v1/machines/:id/snapshots    { kind: disk }
 POST   /v1/machines/:id/restore      { snapshot }
 GET    /v1/machines/:id/audit        records + seals
 
-# M3.5 (dev box, §11.5)
-GET    /v1/machines/:id/pty          upgrade to WebSocket
-POST   /v1/devboxes                  { template, preset, repo?, policy? }
-POST   /v1/devboxes/:id/start        boot from the box's last snapshot
-POST   /v1/devboxes/:id/stop         snapshot the disk, then stop
+# M3.5 (dev box, §11.5; needs the devbox scope)
+POST   /v1/devboxes                  { template, preset, policy? }
+GET    /v1/devboxes/:id
+DELETE /v1/devboxes/:id              destroy the box and its snapshots
+POST   /v1/devboxes/:id/start        new machine from the last snapshot
+POST   /v1/devboxes/:id/stop         snapshot the disk, then destroy the machine
+POST   /v1/devboxes/:id/code         { repo, ref } host fetches, copies a bundle in
+GET    /v1/devboxes/:id/pty          upgrade to WebSocket
 
 # M4–M5
 POST   /v1/services                  { template, domains, env, volume, replicas: 1 }
@@ -578,7 +581,9 @@ Code in a machine needs to call paid APIs. It must not receive the key.
      replaced by their caller; services are redeployed automatically.
 4. The proxy replaces the placeholder **only** when all of these hold:
    - the request matches the grant's host, method and path prefix;
-   - the placeholder is the **entire value of the one configured header**.
+   - the placeholder is the **entire value of the one configured header**
+     (from M3.5, a grant may instead say `Bearer`: the value is then
+     `Bearer ` and the placeholder, and nothing else).
    It never rewrites bodies, URLs, query strings or any other header.
 5. An intercepted request that carries a placeholder anywhere else — another
    header, the body, the URL, or a request to a different host — is
@@ -671,7 +676,7 @@ with proof.
   vsock connection.
 
 Snapshots are bound by the same policy as their machine and are deleted with
-it unless pinned.
+it unless pinned, or owned by a dev box (§11.5), which keeps its last one.
 
 ---
 
@@ -747,33 +752,75 @@ moves.
 
 ### 11.5 Dev box (M3.5)
 
-A **dev box** is a machine a person works in by hand, through a terminal, for
-days. The main use: run a coding agent such as Claude Code or Copilot CLI in
-it, with the operator's API keys usable but never inside the box.
+A **dev box** is a place a person works in by hand, through a terminal, for
+days. The main use: run a coding agent such as Claude Code in it, with the
+operator's API key usable but never inside the box.
 
-It is built from parts the earlier milestones already make:
+A box is a record that outlives its machines. It runs **at most one machine at
+a time**; `start` refuses while one runs. Every `start` boots a **new**
+machine from the box's last disk snapshot (§10), so each session gets a new
+machine ID, new placeholders (§8) and a new proxy CA. Nothing that binds to a
+machine is carried over.
 
-- **Terminal.** `GET /v1/machines/:id/pty` and `sandpiper shell <box>`. The
+**Lifecycle.**
+
+```
+created ──start──► running ──stop──► stopped ──start──► running …
+                      │                  │
+                      └──── max age ─────┴──► destroyed (snapshots deleted)
+```
+
+- **Every host-made stop snapshots first:** idle TTL, the machine's max time,
+  a policy violation, a host drain. Only two cases skip the snapshot and fall
+  back to the last good one: a crash (the disk may be half written) and a
+  failed wall check (the machine is not trusted). A snapshot that fails also
+  falls back. Each case is an event.
+- **Time.** Three limits, all enforced by the host:
+  - *Idle TTL* pauses while a terminal is attached.
+  - *Machine max time* (box policy, default 12 h, within the pool's ceiling)
+    ends one session with a snapshot.
+  - *Box max age* (default 7 days) counts from creation, stopped time
+    included. A warning event and a terminal notice come 24 h before. Then the
+    box and its snapshots are destroyed. Work not taken out is lost.
+- **Snapshots.** A box keeps only its last snapshot unless one is pinned.
+  Box snapshots count toward the project's disk quota, and are deleted with
+  the box. Host loss loses them: they are not copied off the host.
+- **Access.** Boxes need their own `devbox` scope (§4.1). A key with only the
+  create-in-`untrusted` scope, such as the one Litro agents use, cannot list,
+  start or attach to a box.
+
+**Parts.**
+
+- **Terminal.** `GET /v1/devboxes/:id/pty` and `sandpiper shell <box>`. The
   PTY moves forward from M5 for this. The guest agent runs the shell as the
-  workload user, like any `exec`.
-- **Lifetime.** The idle TTL pauses while a terminal is attached. `stop`
-  snapshots the disk (§10) and destroys the machine; `start` boots a new
-  machine from that snapshot. The box, not each machine, owns the snapshots
-  and the placeholders (§8), so an agent's saved settings still work after
-  `start`. This is not branching (§10): a box runs at most one machine at a
-  time, and `start` refuses while one runs. A box has a max age set by
-  policy (default 7 days), and then it is destroyed with its snapshots and
-  its placeholders.
-- **Code in.** `git clone` through the egress allowlist (§7.3), with a grant
-  for the git host's token (§8).
+  workload user, like any `exec`. A PTY sends the guest's raw bytes to the
+  operator's terminal, so `sandpiper shell` drops the sequences that read
+  from or act outside that terminal: clipboard (OSC 52), hyperlinks (OSC 8),
+  title and color queries, device control strings (DCS) and other report
+  requests. The rest passes, so other terminal tricks stay possible
+  (`docs/threats.md` §5).
+- **Code in.** The host fetches the repository with the operator's
+  credential and copies a git bundle into the box through exec stdin. The
+  box gets no git-host token.
 - **Work out.** As git objects only (§11.3). Nothing on the host changes until
   a person merges it.
-- **Agent presets.** One preset per agent. A preset adds the agent's API
-  hosts to the allowlist and the matching grants, so the agent gets a
-  placeholder key (§8). A preset works only for an agent that sends its key
-  in one header to a fixed host. An agent that swaps its key for a second
-  token first needs that exchange done by the proxy; such agents are checked
-  one by one.
+- **Agent presets.** One preset per agent. A preset lists every host the
+  agent needs and the grants it uses; any other host is denied, so the agent
+  must cope with denials. The agent gets a placeholder key in its environment
+  at every session (§8). Settings saved on the disk must not hold a key: a
+  placeholder saved there is dead in the next session.
+  - A preset works only when the key is the entire value of one header, or
+    a `Bearer` token in `Authorization`. The `Bearer` form is new proxy work
+    for M3.5 (§8.4).
+  - An agent that swaps its key for a second token is out of scope. The
+    second token would reach the box. It waits for the host-owned login flow
+    on the later list (§14.1).
+  - Model APIs with server-side web tools can carry data anywhere (§7.3). A
+    preset's key should have them off where the provider allows.
+- **CA.** The guest agent writes the machine's proxy CA at every boot, over
+  any copy on the disk. Settings that embed an older CA file fail closed.
+- **Audit.** Every machine's records carry its box ID, so one query shows a
+  box's whole history (§9).
 
 **Subscription logins are not part of the dev box.** They stay on the later
 list (§14.1), with their risk. A dev box uses API keys until a host-owned login
@@ -782,7 +829,9 @@ flow exists.
 **What stays true.** A dev box is still untrusted: the agent in it, the code
 it writes and the packages it installs are assumed hostile, as in
 `docs/threats.md`. A box lives longer, so anything planted in it also lives
-longer. That is the cost of a long life, and the max age is the limit on it.
+longer, most likely in the agent's own settings (hooks, tools, MCP servers),
+which the next session runs with that session's grants. The max age is the
+limit on that.
 
 ---
 
@@ -838,7 +887,7 @@ locally).
 | **M1** | **On a Linux KVM box.** Host agent + thin control API, one host, one prebuilt **trusted** template on a block image, built for the box's architecture. `create/exec/destroy`, stdin, output caps, TTLs. Sandboxed VMM processes, cgroup limits, TSI off, **`egress: none`: no network device, host firewall as second layer** (§7.3), workloads as an unprivileged uid with `AF_VSOCK` refused, wall checks with canaries (§4.2). Fuzzed guest frame decoder in the VMM process, fresh entropy seed per boot, hardened host (§12). Event log with replay. TS client. | Litro `run-code` works end to end in the playground; a machine cannot reach the LAN or internet; a VMM started with TSI on, or with a network device on an `egress: none` machine, is marked `failed` by the wall check. |
 | **M2** | Policy language and compiler (§7.1), in-guest confinement, egress proxy with allow-list, DNS/IP rules and a CA per machine for intercepted rules, starter presets and blocked-hosts view (§7.3, §8). Wall check adds proxy probes: a denied name gets no answer, a literal IP and each refused range are refused, a direct connection that skips the proxy is dropped. Fuzzed proxy parsers. Work out as git objects (§11.3). Signed host releases (§12). | A test per M1 and M2 row of `docs/threats.md` shows its stated result: **Blocked** attacks fail, **Kept inside** attacks affect nothing outside their machine, **Narrowed** attacks stay within their stated limit, and every attempt appears in the log. |
 | **M3** | Secrets via placeholders and the credential-call deny list (§8), audit chain + seals + off-host checkpoints (§9), disk snapshots and restore (§10). Template builds from OCI/Dockerfile, run inside untrusted machines; signed templates (§12). | An agent calls a paid API with a key it never receives; audit verifies offline. |
-| **M3.5** | **Dev box** (§11.5): PTY and `sandpiper shell`, idle TTL paused while attached, stop and start through disk snapshots, max age, `git clone` through the allowlist, presets for coding agents with placeholder keys. | A person runs `sandpiper shell`, starts Claude Code in the box with a placeholder key, and gets a branch out through §11.3; the real key never enters the box. |
+| **M3.5** | **Dev box** (§11.5): box lifecycle and time limits, PTY and `sandpiper shell` with the terminal filter, stop and start through disk snapshots, code in as a bundle, `devbox` scope, `Bearer` grants, presets for coding agents. | A scripted PTY session brings code in, runs Claude Code with a placeholder key, stops, starts, and runs it again; a second `start` while running is refused; a search of the box's snapshot finds no real key; the proxy log shows the key injected and no probes; max age destroys the box; each M3.5 row of `docs/threats.md` has a test. |
 | **M4** | Service mode on a separate host: persistent volumes, edge proxy with registered domains, deploy with health-checked swap, restart on crash, promotion. | A Litro app is served on its own domain from this platform. |
 | **M5** | Driver 2, memory snapshots, branching, preview URLs, files API, multi-host scheduling. | Start from snapshot < 300 ms; two hosts share load. |
 
