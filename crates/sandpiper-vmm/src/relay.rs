@@ -49,14 +49,33 @@ pub const MAX_ERRORS: usize = 16;
 pub fn start(listener: UnixListener, guest: PathBuf) {
     thread::spawn(move || {
         // The guest agent serves one exchange at a time, and so does the
-        // relay.
+        // relay. A run of failed accepts (out of descriptors, or not a
+        // listening socket at all) backs off, then gives up.
+        let mut failures = 0;
         for host in listener.incoming() {
-            if let Err(e) = host.and_then(|host| exchange(host, &guest)) {
-                eprintln!("sandpiper-vmm: relay: {e}");
+            match host {
+                Ok(host) => {
+                    failures = 0;
+                    if let Err(e) = exchange(host, &guest) {
+                        eprintln!("sandpiper-vmm: relay: {e}");
+                    }
+                }
+                Err(e) => {
+                    failures += 1;
+                    eprintln!("sandpiper-vmm: relay: accept: {e}");
+                    if failures >= MAX_ACCEPT_FAILURES {
+                        eprintln!("sandpiper-vmm: relay stopped");
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
             }
         }
     });
 }
+
+/// Failed accepts in a row before the relay stops.
+const MAX_ACCEPT_FAILURES: u32 = 50;
 
 fn exchange(mut host: UnixStream, guest_path: &Path) -> io::Result<()> {
     let Some(mut guest) = connect_guest(guest_path, &host)? else {

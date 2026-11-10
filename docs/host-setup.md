@@ -152,7 +152,9 @@ curl -s -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
 ```
 
 The exec reply is a stream of events, one JSON object per line; output is
-base64 in `data`.
+base64 in `data`. Each stream of one exec keeps its first 1 MiB. A machine
+may put 64 MiB of output into the event log in all; past that it is
+stopped.
 
 ## 5. Give the agent SSH access (run on your Mac)
 

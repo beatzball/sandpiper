@@ -85,9 +85,9 @@ fn mount(
 }
 
 /// Enter the sandbox. `disk` is the machine's disk image; inside, it is the
-/// only host file visible, at [`DISK`]. The caller must hold the relay's
-/// listener at [`RELAY_FD`]. Returns in the sandboxed child; the parent
-/// never returns.
+/// only host file visible, at [`DISK`]. With `relay`, the caller holds the
+/// relay's listener at [`RELAY_FD`] and it stays open. Returns in the
+/// sandboxed child; the parent never returns.
 ///
 /// With `lifeline`, stdin is a pipe from the driver: when it closes, the
 /// supervisor kills the machine.
@@ -101,6 +101,7 @@ pub fn enter(
     uid: u32,
     gid: u32,
     lifeline: bool,
+    relay: bool,
 ) -> io::Result<OwnedFd> {
     // libkrun loads its kernel library by name when the VM starts, which is
     // after the host filesystem is gone. Load it now; libkrun's own dlopen
@@ -165,7 +166,8 @@ pub fn enter(
             os(libc::dup3(alive[0], ALIVE_FD, libc::O_CLOEXEC))?;
             libc::close(alive[0]);
         }
-        os(libc::syscall(libc::SYS_close_range, RELAY_FD + 1, libc::c_uint::MAX, 0) as libc::c_int)
+        let first_closed = if relay { RELAY_FD + 1 } else { ALIVE_FD + 1 };
+        os(libc::syscall(libc::SYS_close_range, first_closed, libc::c_uint::MAX, 0) as libc::c_int)
             .map_err(|e| io::Error::other(format!("close_range: {e}")))?;
     }
     // SAFETY: ALIVE_FD is open and owned by nothing else from here on.

@@ -21,7 +21,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -41,6 +41,9 @@ use crate::ids;
 pub const UID_BASE: u32 = 1_900_000_000;
 
 const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long an exec waits for the relay's Ready. Longer than boot: a busy
+/// guest answers only after its previous exchange is done.
+const EXEC_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a machine gets to stop after its lifeline closes, before
 /// `cgroup.kill`.
 const STOP_GRACE: Duration = Duration::from_secs(2);
@@ -60,8 +63,6 @@ const MAX_ERRORS: usize = 16;
 const MACHINE_LOG_QUOTA: u64 = 64 << 20;
 /// Most bytes of command, environment and working directory in one exec.
 pub const MAX_REQUEST: usize = 256 << 10;
-/// The descriptor a `boot` child receives the relay's listener on.
-const RELAY_FD: i32 = 4;
 
 #[derive(Clone)]
 pub struct Config {
@@ -127,6 +128,9 @@ struct Machine {
     reason: Mutex<Option<String>>,
     last_active: Mutex<Instant>,
     busy: AtomicBool,
+    /// The exec whose end is not yet recorded. Whoever takes it records
+    /// the end, exactly once: the exec itself, or a destroy.
+    active: Mutex<Option<String>>,
     execs: AtomicU64,
     /// Bytes of guest data this machine has put into the event log.
     logged: AtomicU64,
@@ -214,6 +218,10 @@ pub struct Manager {
     /// out again until it is.
     quarantine: Mutex<Vec<(u32, CgroupGroup)>>,
     spawner: Spawner,
+    /// Set at shutdown: no new machines or execs.
+    stopping: AtomicBool,
+    /// Creates in progress, which shutdown waits for.
+    creating: AtomicUsize,
     #[cfg(target_os = "linux")]
     cgroups: Option<crate::cgroup::Root>,
 }
@@ -235,15 +243,9 @@ pub struct ExecArgs {
 }
 
 impl ExecArgs {
-    /// Bytes of command, environment and working directory.
+    /// Bytes of command, environment and working directory, as JSON.
     pub fn request_size(&self) -> usize {
-        self.cmd.iter().map(String::len).sum::<usize>()
-            + self
-                .env
-                .iter()
-                .map(|(k, v)| k.len() + v.len())
-                .sum::<usize>()
-            + self.cwd.as_ref().map_or(0, String::len)
+        serde_json::to_vec(&(&self.cmd, &self.env, &self.cwd)).map_or(usize::MAX, |v| v.len())
     }
 }
 
@@ -260,7 +262,8 @@ impl Manager {
         #[cfg(target_os = "linux")]
         let cgroups = if cfg.sandbox {
             let root = crate::cgroup::Root::setup(&cfg.state.join("machines"))?;
-            root.remove_leftovers();
+            // A machine's uid is free only once its processes are gone.
+            root.remove_leftovers()?;
             Some(root)
         } else {
             None
@@ -288,6 +291,8 @@ impl Manager {
             slots: Mutex::new(BTreeSet::new()),
             quarantine: Mutex::new(Vec::new()),
             spawner: Spawner::start(),
+            stopping: AtomicBool::new(false),
+            creating: AtomicUsize::new(0),
             #[cfg(target_os = "linux")]
             cgroups,
         });
@@ -306,6 +311,13 @@ impl Manager {
     }
 
     pub fn create(&self, req: CreateRequest) -> Result<serde_json::Value> {
+        // Counted before the check, so a shutdown that sets `stopping` either
+        // turns this away or waits for it.
+        self.creating.fetch_add(1, Ordering::SeqCst);
+        let _done = Decrement(&self.creating);
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(Error::new(503, "the host agent is stopping"));
+        }
         let image = self.template_image(&req.template)?;
         let idle = req.idle.unwrap_or(self.cfg.idle);
         let max = req.max.unwrap_or(self.cfg.max);
@@ -358,6 +370,7 @@ impl Manager {
             reason: Mutex::new(None),
             last_active: Mutex::new(Instant::now()),
             busy: AtomicBool::new(false),
+            active: Mutex::new(None),
             execs: AtomicU64::new(0),
             logged: AtomicU64::new(0),
             console,
@@ -469,10 +482,8 @@ impl Manager {
                 None
             }
         };
-        // After the cgroup hook, which uses a descriptor this one may
-        // replace.
-        pass_fd(&mut cmd, listener.as_raw_fd(), RELAY_FD);
-        cmd.args(["--relay-fd", &RELAY_FD.to_string()]);
+        pass_fd(&mut cmd, listener.as_raw_fd());
+        cmd.args(["--relay-fd", &listener.as_raw_fd().to_string()]);
         let (lifeline_r, lifeline_w) = io::pipe()?;
         cmd.stdin(lifeline_r)
             .stdout(Stdio::piped())
@@ -598,6 +609,9 @@ impl Manager {
                 ),
             ));
         }
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(Error::new(503, "the host agent is stopping"));
+        }
         let not_running = || Error::new(404, format!("no running machine {id}"));
         let m = self.lookup(id).ok_or_else(not_running)?;
         // Under the state lock: a destroy either sees this exec as busy and
@@ -617,15 +631,17 @@ impl Manager {
                 "an exec is already running on this machine",
             ));
         }
+        let exec = format!("e{}", m.execs.fetch_add(1, Ordering::SeqCst) + 1);
+        *m.active.lock().expect("active lock") = Some(exec.clone());
         drop(state);
         *m.last_active.lock().expect("lock") = Instant::now();
-        let exec = format!("e{}", m.execs.fetch_add(1, Ordering::SeqCst) + 1);
         match self
             .log
             .append(id, "exec.started", json!({"exec": exec, "cmd": args.cmd}))
         {
             Ok(e) => Ok((exec, e.seq)),
             Err(e) => {
+                *m.active.lock().expect("active lock") = None;
                 m.busy.store(false, Ordering::SeqCst);
                 Err(e.into())
             }
@@ -636,56 +652,68 @@ impl Manager {
     /// result go to the event log; this returns when it has ended. Always
     /// records an end (`exec.exited`, `exec.timedout` or `exec.failed`).
     pub fn run_exec(&self, id: &str, exec: &str, args: ExecArgs) {
+        // Gone already: its destroy recorded this exec's end.
         let Some(m) = self.lookup(id) else {
-            let _ = self.log.append(
-                id,
-                "exec.failed",
-                json!({"exec": exec, "reason": "machine stopped"}),
-            );
             return;
         };
         let timeout = args.timeout.unwrap_or(self.cfg.exec_max);
         let timed_out = Arc::new(AtomicBool::new(false));
         let result = self.exchange(&m, exec, args, timeout, &timed_out);
         let stopping = m.state() == State::Stopping;
-        let end = match &result {
-            Ok(Ended::Exited) => None,
-            Ok(Ended::OverQuota) => Some((
+        let backstop = timed_out.load(Ordering::SeqCst);
+        let timed_out_event = || {
+            (
+                "exec.timedout",
+                json!({"exec": exec, "timeoutMs": timeout.as_millis() as u64}),
+            )
+        };
+        let (kind, data) = match &result {
+            Ok(Ended::Exited(data)) => ("exec.exited", data.clone()),
+            Ok(Ended::OverQuota) => (
                 "exec.failed",
                 json!({"exec": exec, "reason": "machine wrote too much to the event log"}),
-            )),
-            Ok(Ended::TimedOut) => Some((
-                "exec.timedout",
-                json!({"exec": exec, "timeoutMs": timeout.as_millis() as u64}),
-            )),
-            Err(_) if timed_out.load(Ordering::SeqCst) => Some((
-                "exec.timedout",
-                json!({"exec": exec, "timeoutMs": timeout.as_millis() as u64}),
-            )),
-            Err(_) if stopping => Some((
+            ),
+            Ok(Ended::TimedOut) => timed_out_event(),
+            Err(_) if backstop => timed_out_event(),
+            Err(_) if stopping => (
                 "exec.failed",
                 json!({"exec": exec, "reason": "machine stopped"}),
-            )),
-            Err(e) => Some((
+            ),
+            Err(e) => (
                 "exec.failed",
                 json!({"exec": exec, "reason": e.to_string()}),
-            )),
+            ),
         };
-        if let Some((kind, data)) = end {
-            let _ = self.log.append(id, kind, data);
-        }
+        self.end_exec(&m, exec, kind, data);
         *m.last_active.lock().expect("lock") = Instant::now();
         m.busy.store(false, Ordering::SeqCst);
+        if stopping {
+            return;
+        }
         match &result {
             Ok(Ended::OverQuota) => {
                 self.destroy_machine(&m, "event log quota reached", true);
             }
+            // The guest did not stop the command at its timeout: it is not
+            // doing its job, so the machine goes.
+            Err(_) if backstop => {
+                self.destroy_machine(&m, "an exec did not stop at its timeout", true);
+            }
             // The relay did not even answer: the machine is wedged, and no
             // later exec would get through either.
-            Err(Failure::NoAnswer(e)) if !stopping => {
+            Err(Failure::NoAnswer(e)) => {
                 self.destroy_machine(&m, &format!("machine stopped answering: {e}"), true);
             }
             _ => {}
+        }
+    }
+
+    /// Record an exec's end, unless a destroy has already recorded it.
+    fn end_exec(&self, m: &Machine, exec: &str, kind: &str, data: serde_json::Value) {
+        let mut active = m.active.lock().expect("active lock");
+        if active.as_deref() == Some(exec) {
+            let _ = self.log.append(&m.id, kind, data);
+            *active = None;
         }
     }
 
@@ -698,7 +726,7 @@ impl Manager {
         timed_out: &Arc<AtomicBool>,
     ) -> std::result::Result<Ended, Failure> {
         let mut conn = UnixStream::connect(m.relay()).map_err(Failure::NoAnswer)?;
-        conn.set_read_timeout(Some(BOOT_TIMEOUT))
+        conn.set_read_timeout(Some(EXEC_READY_TIMEOUT))
             .map_err(Failure::Other)?;
         expect_ready(&mut conn).map_err(Failure::NoAnswer)?;
         conn.set_read_timeout(None).map_err(Failure::Other)?;
@@ -826,19 +854,12 @@ impl Manager {
                     if s.timed_out {
                         return Ok(Ended::TimedOut);
                     }
-                    self.log
-                        .append(
-                            &m.id,
-                            "exec.exited",
-                            json!({
-                                "exec": exec,
-                                "code": s.code,
-                                "stdoutTruncated": s.stdout_truncated || out.cut,
-                                "stderrTruncated": s.stderr_truncated || err.cut,
-                            }),
-                        )
-                        .map_err(Failure::Other)?;
-                    return Ok(Ended::Exited);
+                    return Ok(Ended::Exited(json!({
+                        "exec": exec,
+                        "code": s.code,
+                        "stdoutTruncated": s.stdout_truncated || out.cut,
+                        "stderrTruncated": s.stderr_truncated || err.cut,
+                    })));
                 }
                 Some(other) => {
                     return Err(Failure::Other(io::Error::other(format!(
@@ -853,8 +874,12 @@ impl Manager {
                 }
             };
             other.push(&b);
-            if other.full() && !flush(other).map_err(Failure::Other)? {
-                return Ok(Ended::OverQuota);
+            // Both streams, every frame: a steady trickle on one must not
+            // hold back the other, nor itself.
+            for b in [&mut out, &mut err] {
+                if b.due() && !flush(b).map_err(Failure::Other)? {
+                    return Ok(Ended::OverQuota);
+                }
             }
         }
     }
@@ -867,8 +892,14 @@ impl Manager {
         Ok(())
     }
 
-    /// Destroy every machine, for shutdown.
+    /// Refuse new machines and execs, wait for creates in progress, then
+    /// destroy every machine. For shutdown.
     pub fn destroy_all(&self, reason: &str) {
+        self.stopping.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + BOOT_TIMEOUT * 3;
+        while self.creating.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
         let all: Vec<_> = self
             .machines
             .lock()
@@ -915,6 +946,18 @@ impl Manager {
         let deadline = Instant::now() + EXEC_SETTLE;
         while m.busy.load(Ordering::SeqCst) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
+        }
+        // An exec that has not recorded its end by now (its worker never
+        // got to run) ends here, before the machine.
+        {
+            let mut active = m.active.lock().expect("active lock");
+            if let Some(exec) = active.take() {
+                let _ = self.log.append(
+                    &m.id,
+                    "exec.failed",
+                    json!({"exec": exec, "reason": "machine stopped"}),
+                );
+            }
         }
         let freed = m.cgroup.as_ref().is_none_or(|g| {
             kill_group(g); // anything that raced in
@@ -1014,7 +1057,8 @@ impl Manager {
 
 /// How an exchange ended, short of an error.
 enum Ended {
-    Exited,
+    /// The command exited; the data of its `exec.exited` event.
+    Exited(serde_json::Value),
     /// The guest stopped the command at its timeout.
     TimedOut,
     OverQuota,
@@ -1038,6 +1082,8 @@ impl std::fmt::Display for Failure {
 struct OutputBuffer {
     kind: &'static str,
     pending: Vec<u8>,
+    /// When the oldest pending byte came.
+    since: Option<Instant>,
     total: usize,
     cut: bool,
 }
@@ -1047,6 +1093,7 @@ impl OutputBuffer {
         Self {
             kind,
             pending: Vec::new(),
+            since: None,
             total: 0,
             cut: false,
         }
@@ -1056,15 +1103,20 @@ impl OutputBuffer {
         let room = DEFAULT_OUTPUT_CAP.saturating_sub(self.total);
         let take = b.len().min(room);
         self.cut |= take < b.len();
-        self.pending.extend_from_slice(&b[..take]);
+        if take > 0 {
+            self.pending.extend_from_slice(&b[..take]);
+            self.since.get_or_insert_with(Instant::now);
+        }
         self.total += take;
     }
 
-    fn full(&self) -> bool {
-        self.pending.len() >= OUTPUT_PIECE
+    /// A full piece, or output that has waited [`FLUSH_EVERY`].
+    fn due(&self) -> bool {
+        self.pending.len() >= OUTPUT_PIECE || self.since.is_some_and(|t| t.elapsed() >= FLUSH_EVERY)
     }
 
     fn take(&mut self) -> Option<Vec<u8>> {
+        self.since = None;
         (!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending))
     }
 }
@@ -1111,6 +1163,14 @@ fn remove_group(_: &CgroupGroup) -> bool {
     true
 }
 
+struct Decrement<'a>(&'a AtomicUsize);
+
+impl Drop for Decrement<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 struct SetOnDrop(Arc<AtomicBool>);
 
 impl Drop for SetOnDrop {
@@ -1127,18 +1187,15 @@ impl Drop for ShutdownOnDrop {
     }
 }
 
-/// Make `fd` the child's descriptor `to`, open across exec.
-fn pass_fd(cmd: &mut Command, fd: i32, to: i32) {
+/// Keep `fd` open across exec in the child, at the same number. Nothing
+/// else moves: a `dup2` onto a fixed number could close a descriptor the
+/// spawn itself still uses.
+fn pass_fd(cmd: &mut Command, fd: i32) {
     use std::os::unix::process::CommandExt;
-    // SAFETY: dup2 and fcntl only, which are safe between fork and exec.
+    // SAFETY: one fcntl call, which is safe between fork and exec.
     unsafe {
         cmd.pre_exec(move || {
-            let rc = if fd == to {
-                libc::fcntl(fd, libc::F_SETFD, 0)
-            } else {
-                libc::dup2(fd, to)
-            };
-            if rc < 0 {
+            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
                 Err(io::Error::last_os_error())
             } else {
                 Ok(())
@@ -1198,11 +1255,16 @@ mod tests {
     fn output_buffer_cuts_at_the_cap_and_fills_pieces() {
         let mut b = OutputBuffer::new("exec.stdout");
         b.push(&vec![0; OUTPUT_PIECE - 1]);
-        assert!(!b.full());
+        assert!(!b.due());
         b.push(&[1]);
-        assert!(b.full());
+        assert!(b.due());
         assert_eq!(b.take().unwrap().len(), OUTPUT_PIECE);
         assert!(b.take().is_none());
+        b.push(&[1]);
+        assert!(!b.due());
+        thread::sleep(FLUSH_EVERY);
+        assert!(b.due(), "a small piece is due once it has waited");
+        b.take();
         b.push(&vec![0; DEFAULT_OUTPUT_CAP]);
         assert!(b.cut);
         assert_eq!(b.total, DEFAULT_OUTPUT_CAP);
@@ -1217,6 +1279,11 @@ mod tests {
             stdin: vec![0; 100],
             timeout: None,
         };
-        assert_eq!(a.request_size(), 3 + 3 + 2);
+        assert_eq!(a.request_size(), r#"[["ab","c"],[["K","vv"]],"/w"]"#.len());
+        let many = ExecArgs {
+            cmd: vec![String::new(); 1000],
+            ..a
+        };
+        assert!(many.request_size() > 2000);
     }
 }

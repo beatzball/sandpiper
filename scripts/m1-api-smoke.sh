@@ -73,6 +73,9 @@ check "exec exit code"          "|7"      "$(run_in "$M" '{"cmd":["sh","-c","exi
 check "exec stdin"              "3|0"     "$(run_in "$M" '{"cmd":["wc","-l"],"stdin":"a\nb\nc\n"}')"
 check "exec env and cwd"        "v /tmp|0" "$(run_in "$M" '{"cmd":["sh","-c","echo $K $(pwd)"],"env":{"K":"v"},"cwd":"/tmp"}')"
 check "workload is uid 1000"    "1000|0"  "$(run_in "$M" '{"cmd":["id","-u"]}')"
+check "a steady trickle of output streams in pieces" "1" "$(api POST "/v1/machines/$M/exec" \
+  '{"cmd":["sh","-c","i=0; while [ $i -lt 30 ]; do printf x; sleep 0.05; i=$((i+1)); done"]}' |
+  grep -c '"type":"exec.stdout"' | awk '{print ($1 >= 5)}')"
 check "files persist between execs" "kept|0" \
   "$(run_in "$M" '{"cmd":["sh","-c","echo kept > /tmp/f"]}' >/dev/null; run_in "$M" '{"cmd":["cat","/tmp/f"]}')"
 check "exec timeout"            "|exec.timedout" "$(run_in "$M" '{"cmd":["sleep","30"],"timeoutMs":1000}')"

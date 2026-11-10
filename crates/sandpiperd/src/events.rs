@@ -189,6 +189,20 @@ impl Log {
         Ok(out)
     }
 
+    /// The newest sequence number of `machine`, or 0.
+    pub fn max_seq(&self, machine: &str) -> io::Result<u64> {
+        let inner = self.inner.lock().expect("event log lock");
+        let last: Option<i64> = inner
+            .db
+            .query_row(
+                "SELECT MAX(seq) FROM events WHERE machine = ?1",
+                [machine],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        Ok(last.unwrap_or(0) as u64)
+    }
+
     /// The newest event of `machine` whose type starts with `prefix`.
     pub fn last_of(&self, machine: &str, prefix: &str) -> io::Result<Option<Event>> {
         let inner = self.inner.lock().expect("event log lock");
@@ -253,7 +267,13 @@ pub fn follow(
     tokio::spawn(async move {
         // Subscribe before reading the database, so nothing falls between.
         let mut live = log.subscribe();
-        let mut next = from.max(1);
+        // A cursor past the end starts at the end: nothing was missed.
+        let end = {
+            let (log, m) = (Arc::clone(&log), machine.clone());
+            tokio::task::spawn_blocking(move || log.max_seq(&m)).await
+        };
+        let Ok(Ok(end)) = end else { return };
+        let mut next = from.max(1).min(end + 1);
         'replay: loop {
             let page = {
                 let (log, machine) = (Arc::clone(&log), machine.clone());

@@ -89,19 +89,23 @@ impl Root {
         Ok(Self { disk, base })
     }
 
-    /// Kill and remove machine cgroups a previous run left behind.
-    pub fn remove_leftovers(&self) {
-        let Ok(dir) = fs::read_dir(&self.base) else {
-            return;
-        };
-        for entry in dir.flatten() {
+    /// Kill and remove machine cgroups a previous run left behind. Fails if
+    /// one keeps processes: their uid could otherwise go to a new machine.
+    pub fn remove_leftovers(&self) -> io::Result<()> {
+        for entry in fs::read_dir(&self.base)?.flatten() {
             let name = entry.file_name();
             if crate::ids::is_id(&name.to_string_lossy(), "m") {
                 let g = Group { path: entry.path() };
                 let _ = g.kill();
-                let _ = g.remove();
+                if g.remove().is_err() {
+                    return Err(io::Error::other(format!(
+                        "{} still holds processes after cgroup.kill; stop them, then start again",
+                        g.path.display()
+                    )));
+                }
             }
         }
+        Ok(())
     }
 
     pub fn create(&self, id: &str, limits: Limits) -> io::Result<Group> {

@@ -236,6 +236,7 @@ fn boot(o: &Opts) -> io::Result<std::convert::Infallible> {
                 uid,
                 gid,
                 o.die_with_parent,
+                listener.is_some(),
             )?;
             socket = Some(JAILED_SOCKET.to_owned());
             disk = Some(JAILED_DISK.to_owned());
@@ -323,41 +324,44 @@ fn take_relay_listener(fd: libc::c_int) -> io::Result<UnixListener> {
     }
 }
 
-/// Pass `listener` to a `boot` child as [`RELAY_FD`]. Call after any other
-/// `pre_exec` hook that uses a descriptor: this one may replace whatever
-/// held that number.
+/// Pass `listener` to a `boot` child at its own descriptor number; `boot`
+/// moves it to [`RELAY_FD`] itself. Nothing is moved in the child before
+/// exec: a `dup2` onto a fixed number could close a descriptor the spawn
+/// itself still uses.
 fn pass_relay_listener(cmd: &mut Command, listener: &UnixListener) {
     use std::os::unix::process::CommandExt;
     let fd = listener.as_raw_fd();
-    // SAFETY: dup2 and fcntl only, which are safe between fork and exec.
+    // SAFETY: one fcntl call, which is safe between fork and exec.
     unsafe {
         cmd.pre_exec(move || {
-            let rc = if fd == RELAY_FD {
-                libc::fcntl(fd, libc::F_SETFD, 0)
-            } else {
-                libc::dup2(fd, RELAY_FD)
-            };
-            if rc < 0 {
+            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
                 Err(io::Error::last_os_error())
             } else {
                 Ok(())
             }
         });
     }
-    cmd.args(["--relay-fd", &RELAY_FD.to_string()]);
+    cmd.args(["--relay-fd", &fd.to_string()]);
 }
 
 /// Enter the sandbox. The disk and the guest's socket then live at
 /// [`JAILED_DISK`] and [`JAILED_SOCKET`].
 #[cfg(target_os = "linux")]
-fn enter_jail(jail: &Path, disk: &Path, uid: u32, gid: u32, lifeline: bool) -> io::Result<()> {
-    let alive = sandbox::enter(jail, disk, uid, gid, lifeline)?;
+fn enter_jail(
+    jail: &Path,
+    disk: &Path,
+    uid: u32,
+    gid: u32,
+    lifeline: bool,
+    relay: bool,
+) -> io::Result<()> {
+    let alive = sandbox::enter(jail, disk, uid, gid, lifeline, relay)?;
     thread::spawn(move || sandbox::exit_with_parent(alive));
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn enter_jail(_: &Path, _: &Path, _: u32, _: u32, _: bool) -> io::Result<()> {
+fn enter_jail(_: &Path, _: &Path, _: u32, _: u32, _: bool, _: bool) -> io::Result<()> {
     Err(io::Error::other("the VMM sandbox needs Linux"))
 }
 
