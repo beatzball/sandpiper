@@ -1,0 +1,19 @@
+[package]
+name = "sandpiperd"
+version = "0.0.0"
+description = "The sandpiper host agent: runs machines on one host and serves the API."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+sandpiper-proto.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tokio-stream = "0.1"
+rusqlite = { version = "0.41", features = ["bundled"] }
+base64 = "0.22"

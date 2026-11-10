@@ -18,7 +18,8 @@
 //!
 //! `boot` enters the VM and never returns. `run` is the M0 driver: it starts
 //! a `boot` child, connects to the guest agent, runs one command, prints its
-//! output, and destroys the machine. The host agent replaces `run` in M1.
+//! output, and destroys the machine. The host agent, `sandpiperd`, is the
+//! real driver; `run` stays for tests and development.
 //!
 //! `run` exits with the command's exit code (codes outside 0–255 become 255),
 //! 124 if the command timed out, or 125 if sandpiper itself failed. A command
@@ -26,6 +27,7 @@
 //! apart.
 
 mod krun;
+mod relay;
 #[cfg(target_os = "linux")]
 mod sandbox;
 
@@ -245,6 +247,15 @@ fn boot(o: &Opts) -> io::Result<std::convert::Infallible> {
             unsafe { libc::_exit(EXIT_SANDPIPER.into()) };
         });
     }
+    // Guest frames are decoded here, inside the sandbox, never by the host.
+    let socket_dir = Path::new(&socket)
+        .parent()
+        .ok_or_else(|| io::Error::other("--socket needs a directory"))?;
+    relay::start(
+        socket_dir.to_path_buf(),
+        PathBuf::from(&socket),
+        run_as.map(|(uid, _)| uid),
+    );
     let root = match (&o.root, &disk) {
         (Some(dir), None) => krun::Root::Dir(dir),
         (None, Some(image)) => krun::Root::Disk(image),
@@ -665,12 +676,8 @@ fn run(o: &Opts) -> io::Result<ExitCode> {
     }
 }
 
-/// One exec over the guest agent's socket.
-///
-/// Known gap: this driver decodes guest frames in its own process, which is
-/// root when the VMM is sandboxed. DESIGN.md §4.2 has the sandboxed VMM side
-/// decode and hand the root host agent only typed messages; the host agent
-/// (M1 part 2) is built that way and replaces this driver.
+/// One exec, through the VMM's relay (see `relay`), which has already
+/// checked every frame the guest sent.
 fn exchange(
     o: &Opts,
     socket: &Path,
@@ -679,13 +686,13 @@ fn exchange(
     watchdog: &Watchdog,
     started: Instant,
 ) -> io::Result<Outcome> {
-    let mut conn = match connect(socket, peer_uid, machine, watchdog)? {
+    let relay = socket.with_file_name(relay::HOST_SOCKET);
+    let mut conn = match connect(&relay, peer_uid, machine, watchdog)? {
         Some(conn) => conn,
         None => return Ok(Outcome::TimedOut),
     };
     let ready_at = started.elapsed();
     watchdog.extend_to(Instant::now() + o.timeout);
-    conn.set_read_timeout(None)?;
 
     write_frame(
         &mut conn,
@@ -777,10 +784,9 @@ impl<W: Write> CappedSink<W> {
     }
 }
 
-/// Connect to the guest agent, retrying until it answers Ready. libkrun owns
-/// the listening socket, so a connect can succeed before the guest listens;
-/// only a Ready frame proves the agent is there. Returns `None` if the
-/// watchdog fired during boot.
+/// Connect to the relay, retrying until it listens, and wait for its Ready:
+/// the relay sends it once the guest agent has answered. The watchdog bounds
+/// the wait. Returns `None` if the watchdog fired during boot.
 fn connect(
     socket: &Path,
     peer_uid: Option<u32>,
@@ -824,7 +830,6 @@ fn connect(
                         )));
                     }
                 }
-                conn.set_read_timeout(Some(Duration::from_millis(500)))?;
                 match read_frame(&mut conn) {
                     Ok(Some(Frame::Ready { version })) if version == PROTOCOL_VERSION => {
                         return Ok(Some(conn));
@@ -840,8 +845,8 @@ fn connect(
                             other.kind()
                         )));
                     }
-                    Ok(None) => {}
-                    Err(e) if retryable(&e) => {}
+                    Ok(None) | Err(_) if watchdog.fired() => return Ok(None),
+                    Ok(None) => return Err(io::Error::other("relay closed before Ready")),
                     Err(e) => return Err(e),
                 }
             }

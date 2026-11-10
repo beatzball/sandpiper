@@ -1,0 +1,20 @@
+# The sandpiper host agent. Install the binaries first:
+#   sudo install -m 0755 target/release/sandpiperd target/release/sandpiper-vmm /usr/local/bin/
+[Unit]
+Description=sandpiper host agent
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/sandpiperd --state /var/lib/sandpiper
+# Machines get their own cgroups under this service's cgroup.
+Delegate=yes
+# SIGTERM goes to the host agent alone; it destroys every machine, then
+# exits. Anything left after the timeout is killed.
+KillMode=mixed
+TimeoutStopSec=30
+Restart=on-failure
+StateDirectory=sandpiper
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

@@ -288,7 +288,8 @@ pub fn kill_children_of(supervisor: u32) {
 ///
 /// None of this needs the VMM's cooperation. A SIGKILL to the supervisor
 /// itself still leaves only the VMM's own threads to end the machine; the
-/// host agent (M1 part 2) adds a cgroup and `cgroup.kill` as the final stop.
+/// host agent puts each machine in a cgroup and uses `cgroup.kill` as the
+/// final stop.
 /// Exits with the VMM's status.
 fn supervise(
     child: libc::pid_t,
@@ -401,7 +402,7 @@ pub fn drop_groups() -> io::Result<()> {
     os(unsafe { libc::setgroups(0, std::ptr::null()) }).map(drop)
 }
 
-/// Bound what the VMM's uid can use until cgroups take over (M1 part 2):
+/// Bound what the VMM's uid can use, inside its cgroup's limits:
 /// processes and threads, open files, file size (the disk image is the only
 /// file it writes, and it never grows), and no core dumps.
 pub fn limit_resources(max_file: u64) -> io::Result<()> {

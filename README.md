@@ -11,8 +11,10 @@ One platform runs two kinds of workload on hardware you control:
 **Status:** M0 works on Apple Silicon: a microVM boots and runs a command
 over vsock, about 120 ms warm. M1 has started on Linux KVM: machines boot
 from their own disk image, the VMM runs sandboxed (own uid, namespaces,
-seccomp), and workloads run unprivileged and cannot reach vsock. No
-isolation claims until M1 is done on a real host
+seccomp, cgroup), and workloads run unprivileged and cannot reach vsock. The
+host agent serves create, exec and destroy over HTTP, with a replayable
+event log and time limits. No isolation claims until M1 is done on a real
+host
 (see [DESIGN.md §12](DESIGN.md#12-hosting)).
 
 ## Try M0 (macOS, Apple Silicon)
@@ -34,7 +36,10 @@ the command. The guest has no network device.
 scripts/install-libkrun-linux.sh          # once; see docs/host-setup.md §4.1
 rustup target add "$(uname -m)-unknown-linux-musl"
 scripts/m1-smoke.sh                       # builds the image, runs the checks
+scripts/m1-api-smoke.sh                   # the host agent and its API
 ```
+
+To run the host agent as a service, see docs/host-setup.md §4.2.
 
 On an M3 or newer Mac, a Lima VM with nested virtualization works for
 development (docs/host-setup.md §0.1).
@@ -46,6 +51,7 @@ development (docs/host-setup.md §0.1).
 | `sandpiper-proto` | Frames between host and guest agent |
 | `sandpiper-guest` | Guest agent: listens on vsock, runs commands |
 | `sandpiper-vmm` | One microVM per process, through libkrun |
+| `sandpiperd` | Host agent: runs machines, serves the API, keeps the event log |
 | `sandpiper` | Placeholder for the published client crate |
 
 - [DESIGN.md](DESIGN.md) — architecture, policy model, API sketch, milestones
