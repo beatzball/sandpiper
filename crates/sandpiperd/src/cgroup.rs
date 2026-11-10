@@ -89,23 +89,25 @@ impl Root {
         Ok(Self { disk, base })
     }
 
-    /// Kill and remove machine cgroups a previous run left behind. Fails if
-    /// one keeps processes: their uid could otherwise go to a new machine.
-    pub fn remove_leftovers(&self) -> io::Result<()> {
-        for entry in fs::read_dir(&self.base)?.flatten() {
+    /// Kill and remove machine cgroups a previous run left behind. Returns
+    /// those that keep processes anyway, with the uids of those processes,
+    /// which must not go to a new machine until they are gone.
+    pub fn remove_leftovers(&self) -> Vec<(Vec<u32>, Group)> {
+        let mut stuck = Vec::new();
+        let Ok(dir) = fs::read_dir(&self.base) else {
+            return stuck;
+        };
+        for entry in dir.flatten() {
             let name = entry.file_name();
             if crate::ids::is_id(&name.to_string_lossy(), "m") {
                 let g = Group { path: entry.path() };
                 let _ = g.kill();
                 if g.remove().is_err() {
-                    return Err(io::Error::other(format!(
-                        "{} still holds processes after cgroup.kill; stop them, then start again",
-                        g.path.display()
-                    )));
+                    stuck.push((g.uids(), g));
                 }
             }
         }
-        Ok(())
+        stuck
     }
 
     pub fn create(&self, id: &str, limits: Limits) -> io::Result<Group> {
@@ -161,6 +163,24 @@ impl Group {
     /// SIGKILL every process in the group at once.
     pub fn kill(&self) -> io::Result<()> {
         write(&self.path.join("cgroup.kill"), "1")
+    }
+
+    /// The uids of the processes in the group.
+    fn uids(&self) -> Vec<u32> {
+        let procs = fs::read_to_string(self.path.join("cgroup.procs")).unwrap_or_default();
+        let mut uids: Vec<u32> = procs
+            .split_whitespace()
+            .filter_map(|pid| fs::read_to_string(format!("/proc/{pid}/status")).ok())
+            .filter_map(|status| {
+                status
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Uid:"))
+                    .and_then(|v| v.split_whitespace().next()?.parse().ok())
+            })
+            .collect();
+        uids.sort_unstable();
+        uids.dedup();
+        uids
     }
 
     /// Whether any process is left in the group.

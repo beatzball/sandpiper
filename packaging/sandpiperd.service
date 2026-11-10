@@ -11,7 +11,7 @@ Delegate=yes
 # SIGTERM goes to the host agent alone; it destroys every machine, then
 # exits. Anything left after the timeout is killed.
 KillMode=mixed
-TimeoutStopSec=30
+TimeoutStopSec=60
 Restart=on-failure
 StateDirectory=sandpiper
 StateDirectoryMode=0700

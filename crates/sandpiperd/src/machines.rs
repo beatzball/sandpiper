@@ -48,7 +48,8 @@ const EXEC_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// `cgroup.kill`.
 const STOP_GRACE: Duration = Duration::from_secs(2);
 /// How long past an exec's timeout the host waits for the guest to stop it.
-const HOST_TIMEOUT_GRACE: Duration = Duration::from_secs(2);
+/// The guest is the real enforcer; this only catches one that never answers.
+const HOST_TIMEOUT_GRACE: Duration = Duration::from_secs(15);
 /// How long a destroy waits for an exec in flight to record its end.
 const EXEC_SETTLE: Duration = Duration::from_secs(5);
 const CONSOLE_TAIL: usize = 16 * 1024;
@@ -259,11 +260,28 @@ impl Manager {
                 .mode(0o700)
                 .create(cfg.state.join(dir))?;
         }
+        // A machine's uid is free only once its processes are gone. Uids of
+        // leftovers that survive cgroup.kill stay taken until they are.
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut slots = BTreeSet::new();
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut quarantine = Vec::new();
         #[cfg(target_os = "linux")]
         let cgroups = if cfg.sandbox {
             let root = crate::cgroup::Root::setup(&cfg.state.join("machines"))?;
-            // A machine's uid is free only once its processes are gone.
-            root.remove_leftovers()?;
+            for (uids, g) in root.remove_leftovers() {
+                let mine: Vec<u32> = uids
+                    .into_iter()
+                    .filter_map(|u| u.checked_sub(UID_BASE))
+                    .collect();
+                eprintln!(
+                    "sandpiperd: a leftover machine cgroup keeps processes; slots {mine:?} wait for it"
+                );
+                for slot in mine {
+                    slots.insert(slot);
+                    quarantine.push((slot, g.clone()));
+                }
+            }
             Some(root)
         } else {
             None
@@ -288,8 +306,8 @@ impl Manager {
             cfg,
             log,
             machines: Mutex::new(HashMap::new()),
-            slots: Mutex::new(BTreeSet::new()),
-            quarantine: Mutex::new(Vec::new()),
+            slots: Mutex::new(slots),
+            quarantine: Mutex::new(quarantine),
             spawner: Spawner::start(),
             stopping: AtomicBool::new(false),
             creating: AtomicUsize::new(0),
@@ -379,6 +397,12 @@ impl Manager {
             .lock()
             .expect("machines lock")
             .insert(id.clone(), Arc::clone(&machine));
+        // A shutdown that took its list of machines before this one was in
+        // it set `stopping` first, so this sees it and cleans up itself.
+        if self.stopping.load(Ordering::SeqCst) {
+            self.destroy_machine(&machine, "host agent stopping", false);
+            return Err(Error::new(503, "the host agent is stopping"));
+        }
         if let Err(e) = self.wait_ready(&machine) {
             let reason = format!("machine failed to start: {e}");
             self.destroy_machine(&machine, &reason, true);
@@ -684,27 +708,24 @@ impl Manager {
                 json!({"exec": exec, "reason": e.to_string()}),
             ),
         };
+        let doom = match &result {
+            _ if stopping => None,
+            Ok(Ended::OverQuota) => Some("event log quota reached".to_owned()),
+            // The guest did not stop the command at its timeout: it is not
+            // doing its job, so the machine goes.
+            Err(_) if backstop => Some("an exec did not stop at its timeout".to_owned()),
+            // The relay did not even answer: the machine is wedged, and no
+            // later exec would get through either.
+            Err(Failure::NoAnswer(e)) => Some(format!("machine stopped answering: {e}")),
+            _ => None,
+        };
+        // A doomed machine stops taking execs before this one lets go.
+        let claimed = doom.as_ref().is_some_and(|r| self.begin_stop(&m, r));
         self.end_exec(&m, exec, kind, data);
         *m.last_active.lock().expect("lock") = Instant::now();
         m.busy.store(false, Ordering::SeqCst);
-        if stopping {
-            return;
-        }
-        match &result {
-            Ok(Ended::OverQuota) => {
-                self.destroy_machine(&m, "event log quota reached", true);
-            }
-            // The guest did not stop the command at its timeout: it is not
-            // doing its job, so the machine goes.
-            Err(_) if backstop => {
-                self.destroy_machine(&m, "an exec did not stop at its timeout", true);
-            }
-            // The relay did not even answer: the machine is wedged, and no
-            // later exec would get through either.
-            Err(Failure::NoAnswer(e)) => {
-                self.destroy_machine(&m, &format!("machine stopped answering: {e}"), true);
-            }
-            _ => {}
+        if let (true, Some(reason)) = (claimed, doom) {
+            self.teardown(&m, &reason, true);
         }
     }
 
@@ -896,7 +917,8 @@ impl Manager {
     /// destroy every machine. For shutdown.
     pub fn destroy_all(&self, reason: &str) {
         self.stopping.store(true, Ordering::SeqCst);
-        let deadline = Instant::now() + BOOT_TIMEOUT * 3;
+        // A create that finishes later sees `stopping` and cleans up itself.
+        let deadline = Instant::now() + Duration::from_secs(5);
         while self.creating.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
@@ -918,14 +940,25 @@ impl Manager {
     /// the second call returns at once. Its last event is always
     /// `machine.destroyed`.
     fn destroy_machine(&self, m: &Machine, reason: &str, failed: bool) {
-        {
-            let mut state = m.state.lock().expect("state lock");
-            if *state == State::Stopping {
-                return;
-            }
-            *state = State::Stopping;
+        if self.begin_stop(m, reason) {
+            self.teardown(m, reason, failed);
         }
+    }
+
+    /// Mark a machine stopping, so it takes no more execs. False if
+    /// something else is already stopping it.
+    fn begin_stop(&self, m: &Machine, reason: &str) -> bool {
+        let mut state = m.state.lock().expect("state lock");
+        if *state == State::Stopping {
+            return false;
+        }
+        *state = State::Stopping;
         *m.reason.lock().expect("reason lock") = Some(reason.to_owned());
+        true
+    }
+
+    /// The rest of a destroy, for whoever won [`Self::begin_stop`].
+    fn teardown(&self, m: &Machine, reason: &str, failed: bool) {
         let console = failed.then(|| m.console_tail());
         // The supervisor kills the machine when its lifeline closes.
         drop(m.lifeline.lock().expect("lifeline lock").take());

@@ -272,7 +272,14 @@ pub fn follow(
             let (log, m) = (Arc::clone(&log), machine.clone());
             tokio::task::spawn_blocking(move || log.max_seq(&m)).await
         };
-        let Ok(Ok(end)) = end else { return };
+        let end = match end {
+            Ok(Ok(end)) => end,
+            Ok(Err(e)) => {
+                let _ = tx.send(Ok(stream_error(&e.to_string()))).await;
+                return;
+            }
+            Err(_) => return,
+        };
         let mut next = from.max(1).min(end + 1);
         'replay: loop {
             let page = {
