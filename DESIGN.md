@@ -770,45 +770,58 @@ created ──start──► running ──stop──► stopped ──start─�
                       └──── max age ─────┴──► destroyed (snapshots deleted)
 ```
 
-- **Every host-made stop snapshots first:** idle TTL, the machine's max time,
-  a policy violation, a host drain. Only two cases skip the snapshot and fall
-  back to the last good one: a crash (the disk may be half written) and a
-  failed wall check (the machine is not trusted). A snapshot that fails also
-  falls back. Each case is an event.
+- **Every routine host-made stop snapshots first:** idle TTL, the machine's
+  max time, a host drain. Three cases skip the snapshot and fall back to the
+  last good one: a crash (the disk may be half written), a failed wall check
+  and a policy violation (in both, the session is suspect). A snapshot that
+  fails also falls back. Each case is an event.
+- **Host loss** marks the box `failed`, with an event. `start` is refused;
+  `DELETE` cleans up.
 - **Time.** Three limits, all enforced by the host:
-  - *Idle TTL* pauses while a terminal is attached.
+  - *Idle TTL* pauses while a terminal is attached: a PTY WebSocket that
+    answered a ping in the last 60 s. Several terminals may attach at once.
   - *Machine max time* (box policy, default 12 h, within the pool's ceiling)
     ends one session with a snapshot.
   - *Box max age* (default 7 days) counts from creation, stopped time
     included. A warning event and a terminal notice come 24 h before. Then the
     box and its snapshots are destroyed. Work not taken out is lost.
-- **Snapshots.** A box keeps only its last snapshot unless one is pinned.
-  Box snapshots count toward the project's disk quota, and are deleted with
-  the box. Host loss loses them: they are not copied off the host.
-- **Access.** Boxes need their own `devbox` scope (§4.1). A key with only the
-  create-in-`untrusted` scope, such as the one Litro agents use, cannot list,
-  start or attach to a box.
+- **Snapshots.** A box keeps only its last snapshot. Box snapshots cannot
+  be pinned, count toward the project's disk quota, and are deleted with the
+  box. Host loss loses them: they are not copied off the host.
+- **Access.** Boxes need their own `devbox` scope (§4.1). It covers every
+  operation on a box, on a box's machine and on a box's snapshot, including
+  the general machine routes (`exec`, `fetch`, `snapshots`, `restore`,
+  `DELETE`). A key without it, such as the one Litro agents use, cannot
+  reach a box by any route.
 
 **Parts.**
 
 - **Terminal.** `GET /v1/devboxes/:id/pty` and `sandpiper shell <box>`. The
   PTY moves forward from M5 for this. The guest agent runs the shell as the
-  workload user, like any `exec`. A PTY sends the guest's raw bytes to the
-  operator's terminal, so `sandpiper shell` drops the sequences that read
+  workload user, like any `exec`. A PTY carries the guest's raw bytes to a
+  person's terminal, so the PTY endpoint itself drops the sequences that read
   from or act outside that terminal: clipboard (OSC 52), hyperlinks (OSC 8),
   title and color queries, device control strings (DCS) and other report
-  requests. The rest passes, so other terminal tricks stay possible
-  (`docs/threats.md` §5).
-- **Code in.** The host fetches the repository with the operator's
-  credential and copies a git bundle into the box through exec stdin. The
-  box gets no git-host token.
+  requests. Every client gets this filter. The rest passes, so other terminal
+  tricks stay possible (`docs/threats.md` §5).
+- **Code in.** The host fetches the repository and copies a git bundle into
+  the box through exec stdin. The box gets no git-host token.
+  - A box may name only repositories on its project's list.
+  - The credential comes from the vault (§8), never from the request.
+  - The fetch runs in a jailed helper, as in §11.3: an unprivileged user,
+    network to the one git host only, CPU, memory, time and size caps, a
+    fresh bare repository, no checkout, `fetch.fsckObjects` on.
 - **Work out.** As git objects only (§11.3). Nothing on the host changes until
   a person merges it.
 - **Agent presets.** One preset per agent. A preset lists every host the
   agent needs and the grants it uses; any other host is denied, so the agent
   must cope with denials. The agent gets a placeholder key in its environment
   at every session (§8). Settings saved on the disk must not hold a key: a
-  placeholder saved there is dead in the next session.
+  placeholder saved there is dead in the next session. The proxy knows a
+  box's earlier placeholders until the box is destroyed; one of them is
+  refused and logged as stale, not counted as a probe (§8.5). Where an agent
+  asks a person to approve a new key, the preset writes that approval into
+  the agent's settings at each start.
   - A preset works only when the key is the entire value of one header, or
     a `Bearer` token in `Authorization`. The `Bearer` form is new proxy work
     for M3.5 (§8.4).

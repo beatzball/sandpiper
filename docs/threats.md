@@ -87,7 +87,8 @@ allowed hosts are listed separately and are not closed.
 | Read keys from the proxy through a CPU side channel | **Narrowed, not closed** | CPU mitigations on, SMT off, microcode current on `untrusted` hosts (§12). The proxy still shares CPUs with untrusted machines. | M2 |
 | Keep using a key after it is revoked | **Narrowed, not closed** | Revocations are pushed at once; cached secrets expire within 60 seconds (§8). | M3 |
 | Pin certificates to detect the proxy and refuse to work | **Kept inside** | Pinned clients fail closed. Nothing leaks (§8). | M2 |
-| Use a stolen project key to enter a dev box | **Narrowed, not closed** | Boxes need the `devbox` scope; a key made for machines alone cannot reach them (§4.1, §11.5). A stolen key with that scope can. | M3.5 |
+| Use a stolen project key to enter a dev box | **Narrowed, not closed** | Every route to a box, its machine or its snapshots needs the `devbox` scope; a key made for machines alone cannot reach them (§4.1, §11.5). A stolen key with that scope can. | M3.5 |
+| Attack the host's git through a repository fetched into a dev box | **Narrowed, not closed** | Only repositories on the project's list are fetched, by a jailed helper with network to one git host, caps, a fresh bare repository and no checkout (§11.5). A bug in git itself still lands in that jail. | M3.5 |
 | Steal a control-plane API key that a caller put into a machine | **Left to you** | Placeholders protect only grants (§8), not the platform's own API keys. Never pass an API key into a machine. Scopes limit what a stolen key can do (§4.1). | — |
 
 ## 4. Hiding what was done
@@ -109,7 +110,7 @@ allowed hosts are listed separately and are not closed.
 | Put a backdoor, a changed CI config or an install script in the work itself | **Left to you** | The platform moves the work safely; it cannot judge it. Review before merge, and run CI for that branch in a machine, not on a trusted runner. | — |
 | Write instructions in exec output to steer the calling agent | **Left to you** | Exec output goes back to the caller's model (§11.1). Treat it as untrusted input. The caller's API key should carry no service or promotion scope (§4.1). | — |
 | Print terminal control codes in error messages or console output | **Blocked** | The VMM wrapper cuts and escapes guest text before it prints it (M0 `sanitize`). Blocked host names are escaped too (§7.3, M2). | M0 |
-| Send terminal control codes through a dev box terminal (read the clipboard, fake links, answer terminal queries) | **Narrowed, not closed** | `sandpiper shell` drops clipboard, hyperlink, query and device-control sequences. Other sequences pass, because a terminal needs them (§11.5). | M3.5 |
+| Send terminal control codes through a dev box terminal (read the clipboard, fake links, answer terminal queries) | **Narrowed, not closed** | The PTY endpoint drops clipboard, hyperlink, query and device-control sequences for every client. Other sequences pass, because a terminal needs them (§11.5). | M3.5 |
 | Catch a real secret the operator types or pastes into a dev box terminal | **Left to you** | What is typed into the box is inside the box. Use grants, never paste keys (§8). | — |
 | Print terminal control codes in a command's stdout or stderr | **Left to you** | Command output is the program's own bytes and passes through unchanged. Escape it before showing it in a terminal or a web page. | — |
 | Ship malicious code in a template that a build produced | **Left to you** | A template signature means "this control plane approved these bytes", not "this software is safe". Builds run in untrusted machines (§12). | — |
