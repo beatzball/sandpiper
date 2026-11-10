@@ -122,6 +122,7 @@ allowed hosts are listed separately and are not closed.
 | One machine reaches another over the network | **Blocked** | No route between machines (§7.3). | M1 |
 | Read another machine's data through a CPU side channel | **Narrowed, not closed** | CPU mitigations on, SMT off, microcode current (§12). Machines still share hardware. | M1 |
 | A process in one exec spies on another exec in the same machine | **Narrowed, not closed** | Per-exec confinement is defence in depth, not a trust boundary. Work at different trust levels runs in separate machines (§7.2). | M2 |
+| Plant something in a dev box that runs in the next session | **Narrowed, not closed** | A dev box's disk is kept between sessions, so a planted file survives. It is still inside the one box, and the box is destroyed at its max age (§11.5). | M3.5 |
 | Untrusted code shares a host with a production service | **Blocked** | `untrusted` and `services` pools are on separate hosts (§3, §12). | M4 |
 | Get code an untrusted agent built promoted to a service | **Left to you** | Promotion needs its own scope, and the template is rebuilt for the `services` pool (§4.1, §11.4). A person decides what is promoted. | M4 |
 | Call a production service's public endpoint from a machine | **Blocked** for this platform's services; **Left to you** for others | The edge proxy's addresses are on the deny list (§7.3). A service hosted elsewhere can be called like any allowed host; keep it off allowlists unless needed. | M2 |
