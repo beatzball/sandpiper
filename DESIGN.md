@@ -189,7 +189,12 @@ plane over mutual TLS.
     process's own network namespace, which catches TSI), and a
     `socket(AF_VSOCK, …)` call, which must be refused. A probe fails if any
     connection **reaches a canary**, judged on the host side, never from what
-    the guest reports. Blocked paths use reject rules, so probes return at
+    the guest reports. Two inside results are reported by the guest agent
+    itself: the vsock refusal and "no device-backed network interface". They
+    trust the platform's own agent (a trusted template in M1, the platform
+    layer from M3), and the record names them `guest:…`. Against a hostile
+    guest, the host's own checks hold: the namespace and its devices, the
+    cgroup, the uid and the canaries. Blocked paths use reject rules, so probes return at
     once and do not cost boot time.
   - **Outside checks:** the machine's namespace, tap (if any), cgroup and
     TSI setting are the ones its policy asks for. sandpiper keeps its

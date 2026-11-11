@@ -25,7 +25,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The address the canary inside the VMM's namespace listens on. From a
 /// documentation range, so it means nothing anywhere else.
@@ -33,6 +33,10 @@ const NETNS_CANARY: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 
 /// How long a canary connection gets to send its code.
 const CODE_WAIT: Duration = Duration::from_millis(200);
+/// Connections without the code one canary may take before the check fails.
+const MAX_STRAYS: usize = 8;
+/// How long reading all canaries may take.
+const DRAIN_LIMIT: Duration = Duration::from_secs(1);
 
 /// A VMM process, pinned: while its pidfd says it is alive, its pid and
 /// `/proc` entries are still its own, and `netns` is its namespace.
@@ -59,6 +63,15 @@ impl Vmm {
         }
         // SAFETY: fd is a fresh descriptor we own.
         let pidfd = unsafe { OwnedFd::from_raw_fd(fd) };
+        // The pid could have been reused between reading it and pinning it:
+        // the pinned process must still be the supervisor's child.
+        let parent = fs::read_to_string(format!("/proc/{pid}/status"))?
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse::<u32>().ok());
+        if parent != Some(supervisor) {
+            return Err(io::Error::other("the VMM's pid now names another process"));
+        }
         let netns = fs::File::open(format!("/proc/{pid}/ns/net"))?;
         let vmm = Self { pid, pidfd, netns };
         // Alive now, so the pid was not reused before the pidfd and the
@@ -163,22 +176,35 @@ impl Canaries {
     }
 
     /// The first canary that received this check's code, if any. Other
-    /// connections are read and dropped. Any error fails the check: an
-    /// error must never read as "not reached".
+    /// connections are read and dropped, at most [`MAX_STRAYS`] per canary
+    /// and within [`DRAIN_LIMIT`] in all; past either, the check fails
+    /// rather than wait. Any error fails the check too: an error must never
+    /// read as "not reached".
     pub fn reached(&self) -> io::Result<Option<&'static str>> {
+        let deadline = Instant::now() + DRAIN_LIMIT;
+        let flooded = || io::Error::other("canaries flooded by other connections");
         for (name, listener) in &self.list {
+            let mut strays = 0;
             loop {
                 match listener.accept() {
                     Ok((mut conn, _)) => {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            return Err(flooded());
+                        }
                         conn.set_nonblocking(false)?;
-                        conn.set_read_timeout(Some(CODE_WAIT))?;
-                        let mut got = Vec::new();
-                        let _ = (&mut conn).take(64).read_to_end(&mut got);
-                        if got
+                        conn.set_read_timeout(Some(left.min(CODE_WAIT)))?;
+                        let mut got = [0u8; 64];
+                        let n = conn.read(&mut got).unwrap_or(0);
+                        if got[..n]
                             .windows(self.code.len())
                             .any(|w| w == self.code.as_bytes())
                         {
                             return Ok(Some(name));
+                        }
+                        strays += 1;
+                        if strays >= MAX_STRAYS {
+                            return Err(flooded());
                         }
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
