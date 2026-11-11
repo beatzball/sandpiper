@@ -12,13 +12,18 @@ mod linux;
 #[cfg(target_os = "linux")]
 fn main() {
     // `probe` runs as a workload (through exec) to test the walls from the
-    // inside; see `confine::probe`.
-    if let Some(what) = std::env::args()
-        .nth(1)
-        .filter(|a| a == "probe")
-        .and(std::env::args().nth(2))
+    // inside; see `confine::probe` and `confine::probe_walls`.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [mode, what, rest @ ..] = args.as_slice()
+        && mode == "probe"
     {
-        std::process::exit(confine::probe(&what));
+        std::process::exit(match what.as_str() {
+            "walls" => match rest {
+                [code, canaries @ ..] => confine::probe_walls(code, canaries),
+                [] => 2,
+            },
+            _ => confine::probe(what),
+        });
     }
     if let Err(e) = linux::serve() {
         eprintln!("sandpiper-guest: {e}");

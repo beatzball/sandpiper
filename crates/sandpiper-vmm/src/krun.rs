@@ -36,8 +36,34 @@ mod ffi {
             envp: *const *const c_char,
         ) -> i32;
         pub fn krun_start_enter(ctx: u32) -> i32;
+        #[cfg(feature = "wall-tests")]
+        pub fn krun_add_net_unixstream(
+            ctx: u32,
+            path: *const c_char,
+            fd: i32,
+            mac: *const u8,
+            features: u32,
+            flags: u32,
+        ) -> i32;
     }
 }
+
+/// A wall left open on purpose, in test builds, so the host agent's wall
+/// check can be shown to catch it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Breach {
+    #[default]
+    None,
+    /// TSI on: the guest's sockets act as the VMM process.
+    #[cfg(feature = "wall-tests")]
+    Tsi,
+    /// A network device, backed by this end of a socket pair.
+    #[cfg(feature = "wall-tests")]
+    NetDevice(i32),
+}
+
+#[cfg(feature = "wall-tests")]
+const KRUN_TSI_HIJACK_INET: u32 = 1;
 
 fn check(what: &str, rc: i32) -> io::Result<i32> {
     if rc < 0 {
@@ -98,6 +124,7 @@ pub struct VmConfig<'a> {
     /// `krun_start_enter`, before it opens `/dev/kvm` and the disk: both
     /// must be usable by this uid.
     pub run_as: Option<(u32, u32)>,
+    pub breach: Breach,
     /// Runs last, after libkrun is configured and before it takes over the
     /// process. The sandbox installs its seccomp filter here.
     pub before_enter: &'a dyn Fn() -> io::Result<()>,
@@ -145,7 +172,20 @@ pub fn boot(cfg: &VmConfig) -> io::Result<std::convert::Infallible> {
             "krun_disable_implicit_vsock",
             ffi::krun_disable_implicit_vsock(ctx),
         )?;
-        check("krun_add_vsock", ffi::krun_add_vsock(ctx, 0))?;
+        let tsi = match cfg.breach {
+            #[cfg(feature = "wall-tests")]
+            Breach::Tsi => KRUN_TSI_HIJACK_INET,
+            _ => 0,
+        };
+        check("krun_add_vsock", ffi::krun_add_vsock(ctx, tsi))?;
+        #[cfg(feature = "wall-tests")]
+        if let Breach::NetDevice(fd) = cfg.breach {
+            let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+            check(
+                "krun_add_net_unixstream",
+                ffi::krun_add_net_unixstream(ctx, std::ptr::null(), fd, mac.as_ptr(), 0, 0),
+            )?;
+        }
         check(
             "krun_add_vsock_port2",
             ffi::krun_add_vsock_port2(ctx, cfg.guest_port, cstr(cfg.socket)?.as_ptr(), true),

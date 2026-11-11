@@ -13,7 +13,9 @@ over vsock, about 120 ms warm. M1 has started on Linux KVM: machines boot
 from their own disk image, the VMM runs sandboxed (own uid, namespaces,
 seccomp, cgroup), and workloads run unprivileged and cannot reach vsock. The
 host agent serves create, exec and destroy over HTTP, with a replayable
-event log and time limits. No isolation claims until M1 is done on a real
+event log and time limits, checks every machine's walls before handing it
+out, and keeps its own firewall table. Templates: Alpine, and Alpine with
+Node.js. No isolation claims until M1 is done on a real
 host
 (see [DESIGN.md §12](DESIGN.md#12-hosting)).
 
@@ -37,6 +39,7 @@ scripts/install-libkrun-linux.sh          # once; see docs/host-setup.md §4.1
 rustup target add "$(uname -m)-unknown-linux-musl"
 scripts/m1-smoke.sh                       # builds the image, runs the checks
 scripts/m1-api-smoke.sh                   # the host agent and its API
+scripts/m1-wall-smoke.sh                  # wall checks, firewall, templates
 ```
 
 To run the host agent as a service, see docs/host-setup.md §4.2.

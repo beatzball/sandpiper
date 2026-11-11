@@ -21,6 +21,8 @@ jobs:
       # clippy and check do not link, so sandpiper-vmm is covered here even
       # though libkrun is not installed on the runner.
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test builds that open walls on purpose still lint
+        run: cargo clippy -p sandpiper-vmm -p sandpiperd --features sandpiper-vmm/wall-tests,sandpiperd/wall-tests --all-targets -- -D warnings
       - run: cargo test --workspace --exclude sandpiper-vmm
       - name: Guest agent builds for both Linux architectures
         run: |

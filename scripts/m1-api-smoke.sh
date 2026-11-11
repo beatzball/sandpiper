@@ -20,7 +20,7 @@ check() { # name, expected, actual
   if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: want [$2] got [$3]"; fails=$((fails + 1)); fi
 }
 start() {
-  sudo "$D" --state "$STATE" --listen "127.0.0.1:$PORT" 2>>"$STATE.log" &
+  sudo "$D" --state "$STATE" --listen "127.0.0.1:$PORT" --allow-weak-host 2>>"$STATE.log" &
   daemon=$!
   for _ in $(seq 100); do curl -fs "$URL/v1/health" >/dev/null && break; sleep 0.1; done
   TOKEN=$(sudo cat "$STATE/token")
