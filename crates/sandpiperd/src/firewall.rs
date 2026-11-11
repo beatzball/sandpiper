@@ -17,8 +17,8 @@ const TABLE: &str = r#"table inet sandpiper {
     }
     chain forward {
         type filter hook forward priority filter - 10; policy accept;
-        iifname "sp-*" counter drop
-        oifname "sp-*" counter drop
+        iifname "sp-*" counter reject
+        oifname "sp-*" counter reject
     }
     chain output {
         type filter hook output priority filter - 10; policy accept;
@@ -27,7 +27,10 @@ const TABLE: &str = r#"table inet sandpiper {
 }
 "#;
 
-/// Replace sandpiper's table, in one transaction, and return its listing.
+/// Replace sandpiper's table, in one transaction, and return its listing,
+/// once it is known to hold exactly the rules above: the listing becomes
+/// the baseline the watch compares with, so it must not be taken from a
+/// table another program changed in between.
 pub fn install() -> io::Result<String> {
     // Adding first makes the delete safe when the table does not exist yet.
     let script = format!("add table inet sandpiper\ndelete table inet sandpiper\n{TABLE}");
@@ -48,7 +51,22 @@ pub fn install() -> io::Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    listing()
+    let listed = listing()?;
+    if normalize(&listed) != normalize(TABLE) {
+        return Err(io::Error::other(format!(
+            "the sandpiper table does not hold the rules just installed:\n{listed}"
+        )));
+    }
+    Ok(listed)
+}
+
+/// The table's lines without indentation or blank lines.
+fn normalize(table: &str) -> Vec<&str> {
+    table
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
 /// The table as nft lists it now, without counter values, which change.

@@ -52,7 +52,7 @@ echo "template=$TEMPLATE alpine=$ALPINE_VERSION" | sudo tee "$stage/etc/sandpipe
 if [ "$TEMPLATE" = node ]; then
   # The image gets no resolver config of its own: machines have no network.
   sudo cp /etc/resolv.conf "$stage/etc/resolv.conf"
-  sudo chroot "$stage" /sbin/apk add --no-cache --quiet nodejs >/dev/null
+  sudo chroot "$stage" /sbin/apk add --no-cache --quiet nodejs >/dev/null 2>&1
   sudo rm -f "$stage/etc/resolv.conf"
   sudo chroot "$stage" /sbin/apk list --installed nodejs 2>/dev/null | sudo tee -a "$stage/etc/sandpiper-template" >/dev/null
 fi

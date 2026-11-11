@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use sandpiper_proto::{
-    DEFAULT_OUTPUT_CAP, ExecRequest, Frame, PROTOCOL_VERSION, read_frame, write_frame,
+    DEFAULT_OUTPUT_CAP, ExecRequest, ExitStatus, Frame, PROTOCOL_VERSION, read_frame, write_frame,
 };
 use serde_json::json;
 
@@ -477,10 +477,14 @@ impl Manager {
 
     /// Whether this host may start machines, and why not.
     pub fn health(&self) -> serde_json::Value {
-        match &*self.degraded.lock().expect("degraded lock") {
+        let mut h = match &*self.degraded.lock().expect("degraded lock") {
             None => json!({"ok": true}),
             Some(problem) => json!({"ok": false, "reason": problem}),
+        };
+        if cfg!(feature = "wall-tests") {
+            h["build"] = json!("wall-tests");
         }
+        h
     }
 
     /// The wall check (see `walls`): outside checks, then the inside probe
@@ -489,35 +493,56 @@ impl Manager {
     fn check_walls(&self, m: &Machine) -> std::result::Result<serde_json::Value, String> {
         use crate::walls;
         let supervisor = m.child.lock().expect("child lock").id();
-        let vmm = walls::vmm_of(supervisor).map_err(|e| e.to_string())?;
+        let vmm = walls::Vmm::of(supervisor).map_err(|e| e.to_string())?;
         let uid = m.uid.ok_or("a sandboxed machine has no uid")?;
-        let mut passed: Vec<String> = walls::outside(vmm, &m.id, uid)?
+        let mut passed: Vec<String> = walls::outside(&vmm, &m.id, uid)?
             .into_iter()
             .map(String::from)
             .collect();
-        let canaries = walls::Canaries::open(vmm).map_err(|e| format!("canaries: {e}"))?;
+        let canaries = walls::Canaries::open(&vmm).map_err(|e| format!("canaries: {e}"))?;
+        let targets = canaries.targets().map_err(|e| format!("canaries: {e}"))?;
         let mut argv = vec![
             "/sandpiper/guest".to_owned(),
             "probe".to_owned(),
             "walls".to_owned(),
+            canaries.code.clone(),
         ];
-        argv.extend(canaries.addrs());
-        let (out, _) = self
+        argv.extend(targets.iter().map(|(_, addr)| addr.clone()));
+        let (out, exit) = self
             .probe(m, argv)
             .map_err(|e| format!("inside probe: {e}"))?;
-        if let Some(name) = canaries.reached() {
-            return Err(format!("a probe from inside reached the {name} canary"));
+        // Judged by the host, whatever the probe printed.
+        match canaries.reached() {
+            Ok(Some(name)) => return Err(format!("a probe from inside reached the {name} canary")),
+            Ok(None) => {}
+            Err(e) => return Err(format!("canaries: {e}")),
         }
-        // The guest's own report, for the walls only it can see.
+        // A probe that did not finish cleanly proves nothing.
+        if exit.timed_out || exit.stdout_truncated {
+            return Err("the inside probe did not finish".into());
+        }
+        // Every wall must be reported, as `<name> blocked`.
+        let line = |name: &str| {
+            out.lines()
+                .find_map(|l| l.strip_prefix(name)?.strip_prefix(' '))
+                .map(|rest| rest == "blocked")
+        };
         for want in ["vsock", "net-devices"] {
-            let line = out.lines().find(|l| l.split(' ').next() == Some(want));
-            match line {
-                Some(l) if l.ends_with(" blocked") => passed.push(want.to_owned()),
-                Some(_) => return Err(format!("{want} is open inside the guest")),
+            match line(want) {
+                Some(true) => passed.push(format!("guest:{want}")),
+                Some(false) => return Err(format!("{want} is open inside the guest")),
                 None => return Err(format!("the inside probe did not report {want}")),
             }
         }
-        passed.extend(canaries.names().into_iter().map(|n| format!("canary:{n}")));
+        for (name, addr) in &targets {
+            if line(&format!("canary {addr}")).is_none() {
+                return Err(format!("the inside probe did not try the {name} canary"));
+            }
+            passed.push(format!("canary:{name}"));
+        }
+        if exit.code != 0 {
+            return Err(format!("the inside probe exited {}", exit.code));
+        }
         Ok(json!({"walls": passed}))
     }
 
@@ -527,11 +552,14 @@ impl Manager {
     }
 
     /// Run a host command in the machine as a workload, outside the event
-    /// log. Returns its stdout (first 64 KiB) and exit code.
+    /// log, within [`PROBE_TIMEOUT`] in all. Returns its stdout (first
+    /// 64 KiB) and how it exited.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    fn probe(&self, m: &Machine, argv: Vec<String>) -> io::Result<(String, i32)> {
+    fn probe(&self, m: &Machine, argv: Vec<String>) -> io::Result<(String, ExitStatus)> {
         let mut conn = UnixStream::connect(m.relay())?;
-        conn.set_read_timeout(Some(PROBE_TIMEOUT))?;
+        // One deadline for the whole exchange, on the host's clock: a guest
+        // that trickles output cannot stretch it.
+        let _deadline = Deadline::start(conn.try_clone()?, PROBE_TIMEOUT);
         expect_ready(&mut conn)?;
         write_frame(
             &mut conn,
@@ -543,15 +571,18 @@ impl Manager {
         )?;
         write_frame(&mut conn, &Frame::Stdin(Vec::new()))?;
         let mut out = Vec::new();
+        let mut cut = false;
         loop {
             match read_frame(&mut conn)? {
                 Some(Frame::Stdout(b)) => {
                     let room = (64usize << 10).saturating_sub(out.len());
+                    cut |= b.len() > room;
                     out.extend_from_slice(&b[..b.len().min(room)]);
                 }
                 Some(Frame::Stderr(_) | Frame::Error(_)) => {}
-                Some(Frame::Exit(s)) => {
-                    return Ok((String::from_utf8_lossy(&out).into_owned(), s.code));
+                Some(Frame::Exit(mut s)) => {
+                    s.stdout_truncated |= cut;
+                    return Ok((String::from_utf8_lossy(&out).into_owned(), s));
                 }
                 Some(other) => {
                     return Err(io::Error::other(format!("unexpected {}", other.kind())));
@@ -1362,6 +1393,33 @@ impl Drop for Decrement<'_> {
 struct SetOnDrop(Arc<AtomicBool>);
 
 impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Shuts a connection down when its time is up, unless dropped first.
+struct Deadline(Arc<AtomicBool>);
+
+impl Deadline {
+    fn start(conn: UnixStream, after: Duration) -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        let watch = Arc::clone(&done);
+        let deadline = Instant::now() + after;
+        thread::spawn(move || {
+            while !watch.load(Ordering::SeqCst) {
+                if Instant::now() >= deadline {
+                    let _ = conn.shutdown(Shutdown::Both);
+                    return;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        Self(done)
+    }
+}
+
+impl Drop for Deadline {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
     }

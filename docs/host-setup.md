@@ -146,10 +146,12 @@ sudo install -m 0644 packaging/sandpiperd.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now sandpiperd
 ```
 
-The host agent refuses to start if SMT (hyper-threading) is on or CPU
-mitigations are off (DESIGN.md §12). Turn SMT off with `nosmt` on the
-kernel command line (in `/etc/default/grub`, then `sudo update-grub` and
-reboot). Only on a box that never runs untrusted code, pass
+The host agent refuses to start if SMT (hyper-threading) is on, or if any
+file in `/sys/devices/system/cpu/vulnerabilities/` starts with
+`Vulnerable` (DESIGN.md §12). Turn SMT off with `nosmt` on the kernel
+command line (in `/etc/default/grub`, then `sudo update-grub` and reboot),
+and keep mitigations on. Update the kernel and CPU microcode for the rest.
+Only on a box that never runs untrusted code, such as the dev VM, pass
 `--allow-weak-host` instead.
 
 At start it installs its own nftables table, `inet sandpiper`, and checks

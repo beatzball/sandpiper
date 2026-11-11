@@ -18,7 +18,10 @@ fn main() {
         && mode == "probe"
     {
         std::process::exit(match what.as_str() {
-            "walls" => confine::probe_walls(rest),
+            "walls" => match rest {
+                [code, canaries @ ..] => confine::probe_walls(code, canaries),
+                [] => 2,
+            },
             _ => confine::probe(what),
         });
     }

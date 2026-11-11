@@ -22,7 +22,7 @@ check() { # name, expected, actual
   if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: want [$2] got [$3]"; fails=$((fails + 1)); fi
 }
 start() { # [env...] BIN_DIR
-  sudo env "$@" "$BIN/sandpiperd" --state "$STATE" --listen "127.0.0.1:$PORT" --vmm "$BIN/sandpiper-vmm" 2>>"$STATE.log" &
+  sudo env "$@" "$BIN/sandpiperd" --state "$STATE" --listen "127.0.0.1:$PORT" --allow-weak-host --vmm "$BIN/sandpiper-vmm" 2>>"$STATE.log" &
   daemon=$!
   for _ in $(seq 100); do curl -fs "$URL/v1/health" >/dev/null && break; sleep 0.1; done
   TOKEN=$(sudo cat "$STATE/token")
@@ -43,6 +43,12 @@ sudo install -D -m 0644 target/m1/base.img "$STATE/templates/base.img"
 sudo install -D -m 0644 target/m1/node.img "$STATE/templates/node.img"
 
 BIN=target/release
+# This dev VM is not hardened (nested, shared CPU), so the checks pass
+# --allow-weak-host. Show that the check is there.
+if grep -qs '^Vulnerable' /sys/devices/system/cpu/vulnerabilities/*; then
+  check "a weak host is refused without --allow-weak-host" "1" \
+    "$(sudo "$BIN/sandpiperd" --state "$STATE" --listen 127.0.0.1:$PORT 2>&1 | grep -c 'not hardened')"
+fi
 start
 check "health is ok" "True" "$(curl -s "$URL/v1/health" | field '["ok"]')"
 check "firewall table installed" "1" "$(sudo nft list table inet sandpiper >/dev/null 2>&1 && echo 1 || echo 0)"
@@ -53,7 +59,7 @@ for l in sys.stdin:
     e = json.loads(l)
     if e["type"] == "machine.checked": print(" ".join(e["walls"]))')
 check "every machine is wall-checked" \
-  "netns netns-devices cgroup uid vsock net-devices canary:host-loopback canary:host-lan canary:vmm-netns" "$walls"
+  "netns netns-devices cgroup uid guest:vsock guest:net-devices canary:host-loopback canary:host-lan canary:vmm-netns" "$walls"
 api DELETE "/v1/machines/$M" >/dev/null
 
 N=$(api POST /v1/machines '{"template":"node"}' | field '["id"]')
@@ -74,6 +80,7 @@ BIN=target/wall-tests/release
 for wall in tsi net; do
   start SANDPIPER_BREAK_WALL=$wall
   out=$(api POST /v1/machines '{"template":"base"}')
+  check "a test build says so" "wall-tests" "$(curl -s "$URL/v1/health" | field '["build"]')"
   check "a machine with $wall open is refused" "500" "$(echo "$out" | status)"
   case $wall in
     tsi) want="wall check failed: a probe from inside reached the vmm-netns canary" ;;

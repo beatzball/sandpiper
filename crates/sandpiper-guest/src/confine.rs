@@ -114,12 +114,13 @@ pub fn probe(what: &str) -> i32 {
 ///   device (such as virtio-net). Software-only interfaces with nowhere to
 ///   send to, such as `lo` and the kernel's `dummy0`, do not count. If the
 ///   list cannot be read, the wall counts as open;
-/// - `canary ADDR`: a TCP connection to each of the host's canaries. The
-///   host judges these by whether its listener was reached, not by what
-///   this prints.
+/// - `canary ADDR`: a TCP connection to each of the host's canaries, which
+///   sends `code` if it gets through. The host judges these by whether the
+///   code reached its listener, not by what this prints.
 ///
 /// Exits 0 only if every line says `blocked`.
-pub fn probe_walls(canaries: &[String]) -> i32 {
+pub fn probe_walls(code: &str, canaries: &[String]) -> i32 {
+    use std::io::Write;
     use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
     let mut all = true;
@@ -134,9 +135,13 @@ pub fn probe_walls(canaries: &[String]) -> i32 {
     });
     line("net-devices", matches!(backed, Ok(false)));
     for c in canaries {
-        let reached = c
-            .parse::<SocketAddr>()
-            .is_ok_and(|addr| TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok());
+        let reached = c.parse::<SocketAddr>().is_ok_and(|addr| {
+            TcpStream::connect_timeout(&addr, Duration::from_secs(1))
+                .map(|mut s| {
+                    let _ = s.write_all(code.as_bytes());
+                })
+                .is_ok()
+        });
         line(&format!("canary {c}"), !reached);
     }
     if all { 0 } else { 1 }

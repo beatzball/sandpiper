@@ -136,6 +136,15 @@ fn run(o: Opts) -> io::Result<()> {
         Some(p) => p,
         None => std::env::current_exe()?.with_file_name("sandpiper-vmm"),
     };
+    #[cfg(feature = "wall-tests")]
+    {
+        eprintln!("sandpiperd: TEST BUILD (wall-tests): never use this binary for real machines");
+        if o.state == Path::new("/var/lib/sandpiper") {
+            return Err(io::Error::other(
+                "a wall-tests build refuses the real state directory",
+            ));
+        }
+    }
     fs::DirBuilder::new().recursive(true).create(&o.state)?;
     let state = fs::canonicalize(&o.state)?;
     let token = load_token(&state.join("token"))?;
@@ -221,16 +230,27 @@ async fn shutdown_signal() {
 }
 
 /// What makes this host weaker against side channels than DESIGN.md §12
-/// asks: SMT on, or mitigations turned off on the kernel command line.
+/// asks: SMT on, or any CPU issue the kernel itself reports as
+/// `Vulnerable` (which covers every way a mitigation can be turned off).
 fn weak_host() -> Vec<String> {
     let mut weak = Vec::new();
     let smt = fs::read_to_string("/sys/devices/system/cpu/smt/active").unwrap_or_default();
     if smt.trim() == "1" {
         weak.push("SMT (hyper-threading) is on; boot with nosmt".to_owned());
     }
-    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    if cmdline.split_whitespace().any(|a| a == "mitigations=off") {
-        weak.push("CPU mitigations are off (mitigations=off)".to_owned());
+    if let Ok(dir) = fs::read_dir("/sys/devices/system/cpu/vulnerabilities") {
+        let mut open: Vec<String> = dir
+            .flatten()
+            .filter(|e| fs::read_to_string(e.path()).is_ok_and(|s| s.starts_with("Vulnerable")))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        open.sort();
+        if !open.is_empty() {
+            weak.push(format!(
+                "the kernel reports these CPU issues as Vulnerable: {}",
+                open.join(", ")
+            ));
+        }
     }
     weak
 }
