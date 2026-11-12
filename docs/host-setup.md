@@ -176,6 +176,23 @@ base64 in `data`. Each stream of one exec keeps its first 1 MiB. A machine
 may put 64 MiB of output into the event log in all; past that it is
 stopped.
 
+For a daemon in the Lima dev VM (§0.1), Lima forwards guest loopback TCP
+ports to the Mac. Keep the daemon on `127.0.0.1:7171`; a client on the Mac
+can use `SANDPIPER_URL=http://127.0.0.1:7171`. Check from the Mac:
+
+```sh
+curl --fail http://127.0.0.1:7171/v1/health
+```
+
+Read the token in the VM with `limactl shell sandpiper-dev sudo cat
+/var/lib/sandpiper/token` and set it as `SANDPIPER_TOKEN` in the Mac's client
+environment. If you started the daemon with a different `--state`, read
+that directory's `token` instead. Keep the token out of source files.
+If the Mac already uses port 7171, stop that listener or choose a free
+daemon port and use the same port in the Mac URL. There is no need to bind
+the daemon to a LAN address. The [TypeScript client](../clients/ts/README.md)
+includes a real-host integration script that runs from the Mac.
+
 ## 5. Give the agent SSH access (run on your Mac)
 
 Use a key for sandpiper hosts only. The `-C` comment is public inside the key,

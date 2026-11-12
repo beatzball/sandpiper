@@ -47,6 +47,41 @@ To run the host agent as a service, see docs/host-setup.md §4.2.
 On an M3 or newer Mac, a Lima VM with nested virtualization works for
 development (docs/host-setup.md §0.1).
 
+## TypeScript client
+
+The local ESM package in [`clients/ts`](clients/ts) wraps the M1 HTTP API.
+It requires Node.js 22 or later and has no runtime dependencies:
+
+```sh
+npm --prefix clients/ts ci
+npm --prefix clients/ts run build
+```
+
+Use a relative `file:` dependency on `clients/ts` from your application.
+The package is not published to npm.
+
+```ts
+import { Sandpiper } from '@beatzball/sandpiper';
+
+const client = new Sandpiper({
+  baseUrl: process.env.SANDPIPER_URL!,
+  token: process.env.SANDPIPER_TOKEN!,
+});
+const machine = await client.createMachine({ template: 'node' });
+try {
+  const result = await machine.exec(['node', '-e', 'console.log(1+1)']);
+  console.log(result.stdout); // 2\n
+} finally {
+  await machine.destroy();
+}
+```
+
+The client also supports existing-machine handles, raw streaming exec
+events, and event replay that resumes after a dropped connection. See the
+[client README](clients/ts/README.md) for types, cancellation, error behavior,
+and fake HTTP and real-host test commands. For a daemon in a Lima VM, see
+[host setup §4.2](docs/host-setup.md#42-run-the-host-agent).
+
 ## Layout
 
 | Crate | What it is |
