@@ -3,7 +3,8 @@ import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
-import { Sandpiper, SandpiperError, ExecError, StreamError } from '../dist/index.js';
+import { inspect } from 'node:util';
+import { Sandpiper, SandpiperError, ExecError, StreamError, ConnectionError, Machine } from '../dist/index.js';
 
 const id = 'm_0123456789abcdef';
 const exec = 'e_0123456789abcdef';
@@ -63,7 +64,9 @@ test('create, handle info, and destroy use real routes, JSON, auth, and methods'
     } else if (req.method === 'GET') res.end(JSON.stringify(info));
     else res.writeHead(204).end();
   }, async client => {
-    const machine = await client.createMachine(options);
+    const created = await client.createMachine(options);
+    assert.deepEqual(created.info, info);
+    const machine = created.machine;
     assert.equal(machine.id, id);
     assert.deepEqual(await client.machine(id).info(), info);
     assert.equal(await machine.destroy(), undefined);
@@ -85,7 +88,7 @@ test('exec sends options and aggregates bytes before decoding UTF-8', async () =
       exited({ code: 7, stdoutTruncated: true, stderrTruncated: true })]);
   }, async client => {
     assert.deepEqual(await client.machine(id).exec(['echo', 'hi'], options), {
-      exitCode: 7, stdout: 'a🌊z', stderr: 'warning', stdoutTruncated: true, stderrTruncated: true, timedOut: false,
+      exitCode: 7, stdout: 'a🌊z', stderr: 'warning', stdoutTruncated: true, stderrTruncated: true, timedOut: false, errors: [],
     });
   });
 });
@@ -108,7 +111,7 @@ test('timeout returns partial output, null exit code, and timedOut', async () =>
   await withServer((_req, res) => stream(res, [started,
     event('exec.stdout', 3, { exec, data: 'aGk=' }), event('exec.timedout', 4, { exec, timeoutMs: 10 })]), async client => {
     assert.deepEqual(await client.machine(id).exec(['sleep', '30']), {
-      exitCode: null, stdout: 'hi', stderr: '', timedOut: true, stdoutTruncated: false, stderrTruncated: false,
+      exitCode: null, stdout: 'hi', stderr: '', timedOut: true, stdoutTruncated: null, stderrTruncated: null, errors: [],
     });
   });
 });
@@ -143,11 +146,14 @@ test('a final record without a newline is accepted', async () => {
   });
 });
 
-for (const body of [line(started), line(started) + '{"type":', '{bad json}\n', line({ ...exited(), code: undefined }), line(event('exec.unknown', 3, { exec }))]) {
-  test(`incomplete or malformed exec fails without repeating POST: ${JSON.stringify(body.slice(-30))}`, async () => {
+for (const body of [line(started), '{"type":', '{bad json}\n', line({ ...exited(), code: undefined }),
+  line(started) + line(event('exec.stdout', 3, { exec, data: '!!!!' })),
+  line(started) + line(event('exec.stdout', 3, { exec: 'e_other', data: '' })),
+  line(event('exec.stdout', 3, { exec, data: '' }))]) {
+  test(`incomplete or malformed exec throws StreamError without repeating POST: ${JSON.stringify(body.slice(-40))}`, async () => {
     let calls = 0;
     await withServer((_req, res) => { calls++; res.end(body); }, async client => {
-      await assert.rejects(client.machine(id).exec(['true']));
+      await assert.rejects(client.machine(id).exec(['true']), StreamError);
     });
     assert.equal(calls, 1);
   });
@@ -210,13 +216,15 @@ test('events does not retry HTTP errors', async () => {
 });
 
 for (const method of ['events', 'execStream']) {
-  test(`${method} yields stream.error then throws`, async () => {
+  test(`${method} throws stream.error as StreamError without yielding it`, async () => {
+    let calls = 0;
     const error = { type: 'stream.error', message: 'event log unavailable' };
-    await withServer((_req, res) => stream(res, [error]), async client => {
+    await withServer((_req, res) => { calls++; stream(res, [started, error]); }, async client => {
       const iterator = method === 'events' ? client.events(id) : client.machine(id).execStream(['true']);
-      assert.deepEqual(await iterator.next(), { value: error, done: false });
-      await assert.rejects(iterator.next(), StreamError);
+      assert.deepEqual((await iterator.next()).value, started);
+      await assert.rejects(iterator.next(), error => error instanceof StreamError && error.message === 'event log unavailable');
     });
+    assert.equal(calls, 1);
   });
 }
 
@@ -261,9 +269,218 @@ test('redirects are refused', async () => {
 
 test('invalid ids and cursors are rejected before HTTP', async () => {
   const client = new Sandpiper({ baseUrl: 'http://127.0.0.1:1', token: 'test-token' });
-  for (const value of ['..', 'bad/id', 'm_0123456789ABCDEF']) assert.throws(() => client.machine(value), TypeError);
+  for (const value of ['', '..', 'bad/id', 'a b', 'x'.repeat(129), 'm_0123456789abcdef?x']) assert.throws(() => client.machine(value), TypeError);
+  // Ids are not tied to today's format, so a new host id format keeps working.
+  assert.equal(client.machine('m_0123456789ABCDEF-x').id, 'm_0123456789ABCDEF-x');
   for (const from of [0, -1, 1.5, NaN, Infinity]) await assert.rejects(all(client.events(id, { from })), TypeError);
   for (const baseUrl of ['file:///tmp', 'http://user:pass@localhost', 'http://localhost/?x=1', 'http://localhost/#x']) {
     assert.throws(() => new Sandpiper({ baseUrl, token: 'test-token' }), TypeError);
   }
 });
+
+// ---- Limits against a broken or hostile server (blocking #1) ----
+
+test('a record with no newline stops at the record cap with StreamError', async () => {
+  let sent = 0;
+  await withServer(async (_req, res) => {
+    res.write(line(started) + '{"type":"exec.stdout","data":"');
+    const piece = 'a'.repeat(1 << 20);
+    // 64 MiB unless the client hangs up first.
+    for (let i = 0; i < 64 && !res.destroyed; i++) {
+      if (!res.write(piece)) await Promise.race([once(res, 'drain'), once(res, 'close')]);
+      sent++;
+    }
+    res.end();
+  }, async client => {
+    await assert.rejects(client.machine(id).exec(['true']), error => error instanceof StreamError && /longer than/.test(error.message));
+  });
+  assert.ok(sent < 32, `server sent ${sent} MiB before the client stopped`);
+});
+
+test('a huge error body is cut to 64 KiB and still gives SandpiperError', async () => {
+  await withServer((_req, res) => { res.writeHead(500); res.end('x'.repeat(8 << 20)); }, async client => {
+    await assert.rejects(client.machine(id).info(), error =>
+      error instanceof SandpiperError && error.status === 500 && error.message.length === 64 << 10);
+  });
+});
+
+test('a huge JSON body is refused with StreamError', async () => {
+  await withServer((_req, res) => res.end(JSON.stringify({ ...info, pad: 'x'.repeat(2 << 20) })), async client => {
+    await assert.rejects(client.machine(id).info(), StreamError);
+  });
+});
+
+test('exec output past the client cap throws StreamError', async () => {
+  await withServer(async (_req, res) => {
+    res.write(line(started));
+    const data = Buffer.alloc(1 << 20, 'x').toString('base64');
+    for (let i = 0; i < 17 && !res.destroyed; i++) {
+      if (!res.write(line(event('exec.stdout', 3 + i, { exec, data })))) await Promise.race([once(res, 'drain'), once(res, 'close')]);
+    }
+    res.end(line({ ...exited(), seq: 20 }));
+  }, async client => {
+    await assert.rejects(client.machine(id).exec(['true']), error => error instanceof StreamError && /stdout is larger/.test(error.message));
+  });
+});
+
+// ---- The public surface (blocking #2) ----
+
+test('the transport and the Machine constructor are not public', async () => {
+  const client = new Sandpiper({ baseUrl: 'http://127.0.0.1:1', token: 'test-token' });
+  assert.equal('request' in client, false);
+  assert.deepEqual(Object.getOwnPropertyNames(Sandpiper.prototype).sort(), ['constructor', 'createMachine', 'events', 'health', 'machine']);
+  assert.throws(() => new Machine(), TypeError);
+  assert.throws(() => new Machine(Symbol('sandpiper.internal'), {}, id), TypeError);
+  assert.ok(client.machine(id) instanceof Machine);
+});
+
+// ---- The token stays secret (blocking #4) ----
+
+test('the token never shows in inspect, JSON, or a bad-token error', async () => {
+  const token = 'SECRET-TOKEN-1234';
+  const client = new Sandpiper({ baseUrl: 'http://127.0.0.1:1', token });
+  const machine = client.machine(id);
+  for (const text of [inspect(client, { showHidden: true, depth: 9 }), inspect(machine, { showHidden: true, depth: 9 }),
+    JSON.stringify(client), JSON.stringify(machine), JSON.stringify({ ...machine }), String(Object.values(machine))]) {
+    assert.ok(!text.includes(token), text);
+  }
+  for (const bad of ['secret\nline', 'has space', '', 'café']) {
+    assert.throws(() => new Sandpiper({ baseUrl: 'http://localhost', token: bad }), error =>
+      error instanceof TypeError && !error.message.includes(bad || '\u0000'));
+  }
+});
+
+// ---- A quiet exec survives an idle connection drop (blocking #5) ----
+
+test('blank keep-alive lines between events are ignored', async () => {
+  await withServer(async (_req, res) => {
+    res.write(line(started));
+    for (let i = 0; i < 3; i++) { res.write('\n'); await delay(5); }
+    res.end(line(exited()));
+  }, async client => assert.equal((await client.machine(id).exec(['sleep', '400'])).exitCode, 0));
+});
+
+for (const mode of ['socket failure', 'partial record']) {
+  test(`exec resumes from the event log after a ${mode} and never re-POSTs`, async () => {
+    const requests = [];
+    await withServer(async (req, res) => {
+      requests.push(`${req.method} ${req.url}`);
+      if (req.method === 'POST') {
+        res.write(line(started) + line(event('exec.stdout', 3, { exec, data: Buffer.from('a').toString('base64') })));
+        await delay(20);
+        // An idle body timeout looks like this to the client.
+        if (mode === 'socket failure') res.destroy();
+        else res.end('{"type":"exec.std');
+      } else {
+        // The machine's log: events of another exec and other machine events are skipped.
+        stream(res, [
+          event('exec.stdout', 4, { exec, data: Buffer.from('b').toString('base64') }),
+          event('exec.error', 5, { exec, message: 'late warning' }),
+          { ...exited({ code: 3 }), seq: 6 },
+          event('exec.started', 7, { exec: 'e_other', cmd: ['true'] }),
+        ]);
+      }
+    }, async client => {
+      const result = await client.machine(id).exec(['sh', '-c', 'echo a; sleep 400; echo b']);
+      assert.deepEqual(result, { exitCode: 3, stdout: 'ab', stderr: '', stdoutTruncated: false, stderrTruncated: false, timedOut: false, errors: ['late warning'] });
+    });
+    assert.deepEqual(requests, [`POST /v1/machines/${id}/exec`, `GET /v1/events?machine=${id}&from=4`]);
+  });
+}
+
+test('a drop before exec.started throws ConnectionError and does not resume', async () => {
+  let calls = 0;
+  await withServer(async (_req, res) => { calls++; res.writeHead(200); res.write(' '); await delay(10); res.destroy(); }, async client => {
+    await assert.rejects(client.machine(id).exec(['true']), ConnectionError);
+  });
+  assert.equal(calls, 1);
+});
+
+// ---- Unknown event types from a newer host are skipped (blocking #6) ----
+
+test('unknown event types are skipped by events() and execStream()', async () => {
+  const future = event('machine.audited', 2, { what: 'new' });
+  await withServer((req, res) => {
+    if (req.method === 'POST') stream(res, [started, { ...future, seq: 3 }, { ...exited(), seq: 4 }]);
+    else stream(res, [event('machine.created', 1, { template: 'node', metadata: null }), future, { ...destroyed, seq: 3 }]);
+  }, async client => {
+    assert.deepEqual((await all(client.events(id))).map(e => e.seq), [1, 3]);
+    assert.deepEqual((await all(client.machine(id).execStream(['true']))).map(e => e.type), ['exec.started', 'exec.exited']);
+  });
+});
+
+test('a known event type with bad fields still throws StreamError naming the type', async () => {
+  await withServer((_req, res) => stream(res, [event('machine.running', 1, { readyMs: 'soon' })]), async client => {
+    await assert.rejects(all(client.events(id)), error => error instanceof StreamError && /machine\.running/.test(error.message));
+  });
+});
+
+// ---- A cursor past the end keeps live events (blocking #7) ----
+
+test('events from a cursor past the end yields the live events the host sends', async () => {
+  const cursors = [];
+  await withServer((req, res) => {
+    cursors.push(new URL(req.url, 'http://x').searchParams.get('from'));
+    // The host clamps from=999 to its end + 1 = 6.
+    stream(res, [event('exec.stdout', 6, { exec, data: '' }), event('exec.stdout', 7, { exec, data: '' }), { ...destroyed, seq: 8 }]);
+  }, async client => assert.deepEqual((await all(client.events(id, { from: 999 }))).map(e => e.seq), [6, 7, 8]));
+  assert.deepEqual(cursors, ['999']);
+});
+
+// ---- Error classes and retry policy ----
+
+test('a stream cut inside a record is a StreamError', async () => {
+  await withServer((_req, res) => res.end(line(started) + '{"type":'), async client => {
+    await assert.rejects(all(client.events(id, { maxRetries: 0 })), error => error instanceof StreamError);
+  });
+});
+
+test('events stops after maxRetries failed connections and reports each retry', async () => {
+  const client = new Sandpiper({ baseUrl: 'http://127.0.0.1:1', token: 'test-token' });
+  const retries = [];
+  await assert.rejects(all(client.events(id, { maxRetries: 2, onRetry: (error, attempt) => retries.push([error.name, attempt]) })),
+    error => error instanceof ConnectionError && error.cause instanceof Error);
+  assert.deepEqual(retries, [['ConnectionError', 1], ['ConnectionError', 2]]);
+  for (const maxRetries of [-1, 1.5, NaN]) await assert.rejects(all(client.events(id, { maxRetries })), TypeError);
+});
+
+test('events does not retry an error thrown by its own callback', async () => {
+  const client = new Sandpiper({ baseUrl: 'http://127.0.0.1:1', token: 'test-token' });
+  let calls = 0;
+  await assert.rejects(all(client.events(id, { onRetry: () => { calls++; null.boom; } })), TypeError);
+  assert.equal(calls, 1);
+});
+
+test('exec.error messages reach the ExecResult', async () => {
+  await withServer((_req, res) => stream(res, [started,
+    event('exec.error', 3, { exec, message: 'cannot start no-such-cmd: No such file or directory' }),
+    { ...exited({ code: 127 }), seq: 4 }]), async client => {
+    const result = await client.machine(id).exec(['no-such-cmd']);
+    assert.equal(result.exitCode, 127);
+    assert.deepEqual(result.errors, ['cannot start no-such-cmd: No such file or directory']);
+  });
+});
+
+test('health reports readiness; invalid machine info is refused', async () => {
+  await withServer((req, res) => {
+    if (req.url === '/v1/health') res.end(JSON.stringify({ ok: false, reason: 'no kvm' }));
+    else res.writeHead(201).end(JSON.stringify({ id, state: 'bogus' }));
+  }, async client => {
+    assert.deepEqual(await client.health(), { ok: false, reason: 'no kvm' });
+    await assert.rejects(client.createMachine({ template: 'node' }), StreamError);
+  });
+});
+
+for (const call of ['createMachine', 'exec']) {
+  test(`AbortSignal cancels ${call} before the host answers`, async () => {
+    await withServer(() => {}, async client => {
+      const controller = new AbortController();
+      const pending = call === 'createMachine'
+        ? client.createMachine({ template: 'node' }, { signal: controller.signal })
+        : client.machine(id).exec(['true'], { signal: controller.signal });
+      await delay(10);
+      controller.abort();
+      await assert.rejects(pending, { name: 'AbortError' });
+    });
+  });
+}

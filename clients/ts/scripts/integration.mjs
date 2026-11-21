@@ -4,14 +4,19 @@ import { Sandpiper } from '../dist/index.js';
 
 const baseUrl = process.env.SANDPIPER_URL;
 
-test('real sandpiperd client integration', { skip: !baseUrl && 'SANDPIPER_URL is unset', timeout: 120_000 }, async t => {
+test('real sandpiperd client integration', { skip: !baseUrl && 'SANDPIPER_URL is unset', timeout: 900_000 }, async t => {
   const token = process.env.SANDPIPER_TOKEN;
   assert.ok(token, 'Set SANDPIPER_TOKEN when SANDPIPER_URL is set');
-  const signal = AbortSignal.timeout(110_000);
+  const signal = AbortSignal.timeout(process.env.SANDPIPER_LONG === '1' ? 890_000 : 110_000);
   const client = new Sandpiper({ baseUrl, token });
-  const machine = await client.createMachine({ template: 'node', ttl: { idleMs: 30_000, maxMs: 120_000 }, metadata: { test: 'typescript-client' } }, { signal });
+  const long = process.env.SANDPIPER_LONG === '1';
+  const { machine, info: created } = await client.createMachine({ template: 'node', ttl: { idleMs: long ? 600_000 : 30_000, maxMs: long ? 900_000 : 120_000 }, metadata: { test: 'typescript-client' } }, { signal });
+  assert.equal(created.id, machine.id);
   let destroyed = false;
   try {
+    await t.test('health reports ok', async () => {
+      assert.deepEqual(await client.health({ signal }), { ok: true });
+    });
     await t.test('create and info report a running node machine', async () => {
       const info = await machine.info({ signal });
       assert.equal(info.state, 'running');
@@ -20,7 +25,7 @@ test('real sandpiperd client integration', { skip: !baseUrl && 'SANDPIPER_URL is
     });
     await t.test('node runs inside the machine and returns 2', async () => {
       const result = await machine.exec(['node', '-e', 'console.log(1+1)'], { signal });
-      assert.deepEqual(result, { exitCode: 0, stdout: '2\n', stderr: '', stdoutTruncated: false, stderrTruncated: false, timedOut: false });
+      assert.deepEqual(result, { exitCode: 0, stdout: '2\n', stderr: '', stdoutTruncated: false, stderrTruncated: false, timedOut: false, errors: [] });
     });
     await t.test('cwd, env, text stdin, and nonzero exit code', async () => {
       const result = await machine.exec(['sh', '-c', 'printf "%s:%s:" "$KEY" "$PWD"; cat; printf warning >&2; exit 7'], {
@@ -45,6 +50,7 @@ test('real sandpiperd client integration', { skip: !baseUrl && 'SANDPIPER_URL is
       const timeout = await machine.exec(['sleep', '30'], { timeoutMs: 500, signal });
       assert.equal(timeout.timedOut, true);
       assert.equal(timeout.exitCode, null);
+      assert.equal(timeout.stdoutTruncated, null);
       assert.equal((await machine.exec(['true'], { signal })).exitCode, 0);
     });
     await t.test('stdout output cap is visible in the result', async () => {
@@ -52,6 +58,16 @@ test('real sandpiperd client integration', { skip: !baseUrl && 'SANDPIPER_URL is
       assert.equal(result.exitCode, 0);
       assert.equal(Buffer.byteLength(result.stdout), 1024 * 1024);
       assert.equal(result.stdoutTruncated, true);
+    });
+    await t.test('a command that cannot start reports why in errors', async () => {
+      const result = await machine.exec(['/no/such/command'], { timeoutMs: 5000, signal });
+      assert.notEqual(result.exitCode, 0);
+      assert.ok(result.errors.length > 0, JSON.stringify(result));
+    });
+    await t.test('a quiet exec longer than the 300 s idle body timeout completes', { skip: !long && 'set SANDPIPER_LONG=1 (takes about 6 minutes)' }, async () => {
+      const result = await machine.exec(['sh', '-c', 'sleep 330; echo done'], { timeoutMs: 400_000, signal });
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.stdout, 'done\n');
     });
     await t.test('the machine cannot reach the internet', async () => {
       const result = await machine.exec(['wget', '-T', '3', '-O', '/dev/null', 'http://1.1.1.1'], { timeoutMs: 5000, signal });
