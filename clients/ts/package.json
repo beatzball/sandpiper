@@ -1,19 +1,54 @@
 {
-  "name": "@beatzball/sandpiper",
+  "name": "@beatzball/sandpiper-client",
   "version": "0.1.0",
-  "private": true,
-  "description": "TypeScript client for the sandpiper host API",
+  "description": "TypeScript client for the sandpiper host API: create microVMs, run commands, follow their event log",
   "license": "Apache-2.0",
+  "keywords": [
+    "sandpiper",
+    "microvm",
+    "sandbox",
+    "agent",
+    "client",
+    "ndjson"
+  ],
+  "homepage": "https://github.com/beatzball/sandpiper/tree/main/clients/ts#readme",
+  "bugs": {
+    "url": "https://github.com/beatzball/sandpiper/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/beatzball/sandpiper.git",
+    "directory": "clients/ts"
+  },
   "type": "module",
-  "engines": { "node": ">=22" },
-  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
-  "files": ["dist", "README.md"],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test test/*.test.mjs",
     "test:integration": "npm run build && node --test scripts/integration.mjs",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "check:pack": "node scripts/check-pack.mjs"
   },
   "devDependencies": {
     "@types/node": "22.18.0",

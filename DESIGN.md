@@ -389,7 +389,7 @@ nothing within the retention window. This matches how Litro sessions already
 work, so a sandbox job survives a browser refresh end to end. Slow consumers do
 not block machines: the server keeps the log, the client catches up.
 
-A TypeScript client (`@beatzball/sandpiper`) wraps this API. It is the only
+A TypeScript client (`@beatzball/sandpiper-client`) wraps this API. It is the only
 thing Litro depends on.
 
 ---
@@ -931,7 +931,7 @@ locally).
 5. **Auth model beyond one operator.** Project-scoped API keys with scopes are
    enough now. Revisit if others get access.
 6. ~~**Name.**~~ **Decided: sandpiper.** Crate `sandpiper`, npm
-   `@beatzball/sandpiper`, repo `beatzball/sandpiper`.
+   `@beatzball/sandpiper-client`, repo `beatzball/sandpiper`.
 7. **Preview domain.** Needs a dedicated registrable domain (§4.5). Pick before
    M5.
 8. **Agent status out of a machine.** A coding agent running in a machine
