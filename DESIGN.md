@@ -389,6 +389,12 @@ nothing within the retention window. This matches how Litro sessions already
 work, so a sandbox job survives a browser refresh end to end. Slow consumers do
 not block machines: the server keeps the log, the client catches up.
 
+The event stream and the exec stream are NDJSON: one JSON object per line.
+When a stream has had no event for 30 seconds, the host writes a blank line,
+so that idle timeouts in clients and proxies do not close a long quiet
+command. Clients must ignore blank lines. Hosts before this change do not
+send them.
+
 A TypeScript client (`@beatzball/sandpiper-client`) wraps this API. It is the only
 thing Litro depends on.
 

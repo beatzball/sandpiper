@@ -23,7 +23,7 @@
   "type": "module",
   "sideEffects": false,
   "engines": {
-    "node": ">=22"
+    "node": ">=22.18"
   },
   "exports": {
     ".": {

@@ -3,7 +3,7 @@
 A typed client for the [sandpiper](https://github.com/beatzball/sandpiper)
 host API. Create a microVM, run commands in it, and follow its event log.
 
-- Node.js 22 or later. Node only, not browsers: it uses `Buffer` and
+- Node.js 22.18 or later (the version CI tests). Node only, not browsers: it uses `Buffer` and
   `node:timers/promises`.
 - ESM only. There is no CommonJS build; use `import`.
 - Types need TypeScript 5.0 or later, with `@types/node` (or the DOM lib)
@@ -86,9 +86,11 @@ for await (const event of machine.execStream(['echo', 'hello'])) {
 `execStream()` ends after `exec.exited`, `exec.timedout`, `exec.failed`, or
 `machine.destroyed`. The command is submitted once and never again. If the
 connection drops after `exec.started`, the client reads the rest of that
-exec from the machine's event log, so a long quiet command keeps going. It
-gives up after 10 failed reconnects in a row and throws `ConnectionError`;
-the command still runs on the host.
+exec from the machine's event log, so a long quiet command keeps going. A
+clean end of the stream before a terminal event counts as a drop. It gives
+up after `maxRetries` failed reconnects in a row (default 10; a received
+event resets the count) and throws `ConnectionError`; the command still runs
+on the host.
 
 ## Events
 
@@ -132,8 +134,9 @@ Requests are never redirected. Only `events()` and the exec resume retry,
 and both only re-read the log.
 
 The client limits what it accepts from a host: one NDJSON record to 4 Mi
-characters, an error body to 64 KiB, a JSON body to 1 MiB, and `exec()`
-output to 16 MiB per stream. A real host stays far below all of these.
+characters, an error body to 64 KiB, a JSON body to 1 MiB, `exec()`
+output to 16 MiB per stream, and `exec()` errors to 256 messages or 1 MiB.
+A real host stays far below all of these.
 
 ## Cancellation and timeouts
 
@@ -147,7 +150,10 @@ until its TTL.
 
 The host writes a blank line on a quiet event stream every 30 seconds, so
 Node's 300-second idle body timeout does not end a long command. Older
-hosts do not; the exec resume above covers them.
+hosts do not. On them each quiet connection ends after 300 seconds and
+counts as a failed reconnect, so with the default `maxRetries` of 10 a
+command that prints nothing survives about 55 minutes. Pass a larger
+`maxRetries`, or `Infinity`, for longer quiet commands.
 
 ## Development
 

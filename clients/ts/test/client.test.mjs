@@ -146,7 +146,7 @@ test('a final record without a newline is accepted', async () => {
   });
 });
 
-for (const body of [line(started), '{"type":', '{bad json}\n', line({ ...exited(), code: undefined }),
+for (const body of ['{"type":', '{bad json}\n', line({ ...exited(), code: undefined }),
   line(started) + line(event('exec.stdout', 3, { exec, data: '!!!!' })),
   line(started) + line(event('exec.stdout', 3, { exec: 'e_other', data: '' })),
   line(event('exec.stdout', 3, { exec, data: '' }))]) {
@@ -360,7 +360,7 @@ test('blank keep-alive lines between events are ignored', async () => {
   }, async client => assert.equal((await client.machine(id).exec(['sleep', '400'])).exitCode, 0));
 });
 
-for (const mode of ['socket failure', 'partial record']) {
+for (const mode of ['socket failure', 'partial record', 'clean end']) {
   test(`exec resumes from the event log after a ${mode} and never re-POSTs`, async () => {
     const requests = [];
     await withServer(async (req, res) => {
@@ -370,7 +370,8 @@ for (const mode of ['socket failure', 'partial record']) {
         await delay(20);
         // An idle body timeout looks like this to the client.
         if (mode === 'socket failure') res.destroy();
-        else res.end('{"type":"exec.std');
+        else if (mode === 'partial record') res.end('{"type":"exec.std');
+        else res.end();
       } else {
         // The machine's log: events of another exec and other machine events are skipped.
         stream(res, [
@@ -484,3 +485,74 @@ for (const call of ['createMachine', 'exec']) {
     });
   });
 }
+
+// ---- Round 2 ----
+
+test('exec.error messages past the client cap throw StreamError', async () => {
+  await withServer(async (_req, res) => {
+    res.write(line(started));
+    const message = 'x'.repeat(4000);
+    for (let i = 0; i < 2000 && !res.destroyed; i++) {
+      if (!res.write(line(event('exec.error', 3 + i, { exec, message })))) await Promise.race([once(res, 'drain'), once(res, 'close')]);
+    }
+    res.end(line({ ...exited(), seq: 5000 }));
+  }, async client => {
+    await assert.rejects(client.machine(id).exec(['true']), error => error instanceof StreamError && /exec\.error/.test(error.message));
+  });
+});
+
+test('too many small exec.error messages throw StreamError', async () => {
+  await withServer((_req, res) => stream(res, [started,
+    ...Array.from({ length: 300 }, (_, i) => event('exec.error', 3 + i, { exec, message: 'x' })),
+    { ...exited(), seq: 400 }]), async client => {
+    await assert.rejects(client.machine(id).exec(['true']), error => error instanceof StreamError && /exec\.error/.test(error.message));
+  });
+});
+
+test('an honest host\'s 16 errors of 4096 bytes fit', async () => {
+  const message = 'é'.repeat(2048);
+  await withServer((_req, res) => stream(res, [started,
+    ...Array.from({ length: 16 }, (_, i) => event('exec.error', 3 + i, { exec, message })),
+    { ...exited(), seq: 40 }]), async client => {
+    assert.equal((await client.machine(id).exec(['true'])).errors.length, 16);
+  });
+});
+
+test('a complete line longer than the record cap throws StreamError', async () => {
+  await withServer((_req, res) => {
+    const data = 'A'.repeat((4 << 20) + 4);
+    stream(res, [started, event('exec.stdout', 3, { exec, data }), exited()]);
+  }, async client => {
+    await assert.rejects(client.machine(id).exec(['true']), error => error instanceof StreamError && /longer than/.test(error.message));
+  });
+});
+
+test('an unknown event type resets the retry count', async () => {
+  let calls = 0;
+  await withServer(async (_req, res) => {
+    calls++;
+    if (calls === 3) return stream(res, [destroyed]);
+    res.writeHead(200);
+    res.write(line(event('machine.audited', calls)));
+    await delay(10);
+    res.destroy();
+  }, async client => {
+    assert.deepEqual((await all(client.events(id, { maxRetries: 1 }))).map(e => e.type), ['machine.destroyed']);
+  });
+  assert.equal(calls, 3);
+});
+
+test('exec maxRetries limits the resume and is checked before HTTP', async () => {
+  const requests = [];
+  await withServer(async (req, res) => {
+    requests.push(req.method);
+    res.writeHead(200);
+    if (req.method === 'POST') res.write(line(started));
+    await delay(10);
+    res.destroy();
+  }, async client => {
+    await assert.rejects(client.machine(id).exec(['true'], { maxRetries: 1 }), ConnectionError);
+    for (const maxRetries of [-1, 1.5, NaN]) await assert.rejects(client.machine(id).exec(['true'], { maxRetries }), TypeError);
+  });
+  assert.deepEqual(requests, ['POST', 'GET', 'GET']);
+});

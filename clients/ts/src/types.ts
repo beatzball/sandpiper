@@ -25,6 +25,12 @@ export interface ExecOptions extends RequestOptions {
   stdin?: string | Uint8Array | undefined;
   /** The host's deadline for the command. The host caps it. */
   timeoutMs?: number | undefined;
+  /**
+   * Failed reconnects in a row before a dropped exec stream throws the last
+   * `ConnectionError`. A received event resets the count. Defaults to 10.
+   * `Infinity` resumes until `signal` aborts.
+   */
+  maxRetries?: number | undefined;
 }
 
 export interface EventsOptions extends RequestOptions {

@@ -34,6 +34,11 @@ export class ExecError extends Error {
 /** A stream that ended inside a record: a lost connection, so safe to resume. */
 class TruncatedStreamError extends StreamError {}
 
+/** A valid record of a type this client does not know. It still moves the cursor. */
+class Skipped {
+  constructor(readonly machine: string, readonly seq: number) {}
+}
+
 /** Longest NDJSON record, in characters. Host records stay far below it. */
 const MAX_RECORD = 4 << 20;
 /** Most bytes read from an error body or a JSON body. */
@@ -41,9 +46,18 @@ const MAX_ERROR_BODY = 64 << 10;
 const MAX_JSON_BODY = 1 << 20;
 /** Most decoded bytes `exec()` keeps per output stream. The host cuts each at 1 MiB. */
 const MAX_OUTPUT = 16 << 20;
-/** Failed reconnects in a row before a dropped exec stream gives up. */
+/** Most `exec.error` messages, and their UTF-8 bytes, `exec()` keeps. The host sends at most 16 of 4096 bytes. */
+const MAX_ERRORS = 256;
+const MAX_ERROR_BYTES = 1 << 20;
+/** Default failed reconnects in a row before a dropped exec stream gives up. */
 const EXEC_RESUME_RETRIES = 10;
 const TERMINAL = new Set(['exec.exited', 'exec.timedout', 'exec.failed', 'machine.destroyed']);
+
+function checkRetries(maxRetries: number): void {
+  if (!(maxRetries === Infinity || (Number.isSafeInteger(maxRetries) && maxRetries >= 0))) {
+    throw new TypeError('maxRetries must be a non-negative integer or Infinity');
+  }
+}
 
 const resumable = (error: unknown) => error instanceof ConnectionError || error instanceof TruncatedStreamError;
 
@@ -106,10 +120,10 @@ function machineInfo(value: Record<string, unknown>): MachineInfo {
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 
 /**
- * Check one record. Returns undefined for a type this client does not know,
+ * Check one record. Returns `Skipped` for a type this client does not know,
  * so a newer host can add event types. Throws on a host `stream.error`.
  */
-function check(value: unknown): SandpiperEvent | undefined {
+function check(value: unknown): SandpiperEvent | Skipped {
   const invalid = (why: string) => new StreamError(`Invalid NDJSON event: ${why}`);
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw invalid('not an object');
   const event = value as Record<string, unknown>;
@@ -141,14 +155,14 @@ function check(value: unknown): SandpiperEvent | undefined {
     case 'exec.exited': valid = strings('exec') && integer('code') && typeof event.stdoutTruncated === 'boolean' && typeof event.stderrTruncated === 'boolean'; break;
     case 'exec.timedout': valid = strings('exec') && integer('timeoutMs'); break;
     case 'exec.failed': valid = strings('exec', 'reason'); break;
-    default: return undefined;
+    default: return new Skipped(event.machine as string, event.seq as number);
   }
   if (!valid) throw invalid(`bad fields for ${type}`);
   return event as unknown as SandpiperEvent;
 }
 
 /** Parse complete NDJSON records across arbitrary HTTP chunk boundaries. */
-async function* records(response: Response, signal: AbortSignal | undefined): AsyncGenerator<SandpiperEvent> {
+async function* records(response: Response, signal: AbortSignal | undefined): AsyncGenerator<SandpiperEvent | Skipped> {
   if (!response.body) throw new StreamError('The response has no body');
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -167,11 +181,11 @@ async function* records(response: Response, signal: AbortSignal | undefined): As
       let start = 0;
       let newline: number;
       while ((newline = text.indexOf('\n', start)) !== -1) {
+        if (pending.length + newline - start > MAX_RECORD) throw new StreamError(`An NDJSON record is longer than ${MAX_RECORD} characters`);
         const line = (pending + text.slice(start, newline)).trim();
         pending = '';
         start = newline + 1;
-        const event = line ? parse(line) : undefined;
-        if (event) yield event;
+        if (line) yield parse(line);
       }
       pending += text.slice(start);
       if (pending.length > MAX_RECORD) throw new StreamError(`An NDJSON record is longer than ${MAX_RECORD} characters`);
@@ -180,8 +194,7 @@ async function* records(response: Response, signal: AbortSignal | undefined): As
         if (line) {
           let value: unknown;
           try { value = JSON.parse(line); } catch { throw new TruncatedStreamError('The stream ended inside an NDJSON record'); }
-          const event = check(value);
-          if (event) yield event;
+          yield check(value);
         }
         return;
       }
@@ -262,9 +275,7 @@ async function* follow(transport: Transport, machineId: string, options: EventsO
   const maxRetries = options.maxRetries ?? Infinity;
   let next = options.from ?? 1;
   if (!Number.isSafeInteger(next) || next < 1) throw new TypeError('from must be a positive safe integer');
-  if (!(maxRetries === Infinity || (Number.isSafeInteger(maxRetries) && maxRetries >= 0))) {
-    throw new TypeError('maxRetries must be a non-negative integer or Infinity');
-  }
+  checkRetries(maxRetries);
   // The highest sequence number yielded. A cursor past the end of the log
   // starts at its end, so the first event may be below `from`.
   let last = 0;
@@ -283,6 +294,7 @@ async function* follow(transport: Transport, machineId: string, options: EventsO
         received = true;
         failures = 0;
         retryMs = 100;
+        if (event instanceof Skipped) continue;
         yield event;
         if (event.type === 'machine.destroyed') return;
       }
@@ -380,6 +392,8 @@ export class Machine {
    */
   async *execStream(cmd: readonly string[], options: ExecOptions = {}): AsyncGenerator<ExecStreamEvent> {
     const { signal, stdin, cwd, env, timeoutMs } = options;
+    const maxRetries = options.maxRetries ?? EXEC_RESUME_RETRIES;
+    checkRetries(maxRetries);
     const input = stdin instanceof Uint8Array
       ? { stdinBase64: Buffer.from(stdin).toString('base64') }
       : { stdin };
@@ -388,9 +402,10 @@ export class Machine {
     let execId: string | undefined;
     let last = 0;
     // `fromLog` events are the whole machine's; skip what is not this exec.
-    const accept = (event: SandpiperEvent, fromLog: boolean): ExecStreamEvent | undefined => {
+    const accept = (event: SandpiperEvent | Skipped, fromLog: boolean): ExecStreamEvent | undefined => {
       if (event.machine !== this.id) throw new StreamError('Event belongs to another machine');
       last = event.seq;
+      if (event instanceof Skipped) return undefined;
       if (event.type === 'machine.destroyed') return event;
       if (!event.type.startsWith('exec.')) {
         if (fromLog) return undefined;
@@ -415,12 +430,13 @@ export class Machine {
         yield accepted;
         if (TERMINAL.has(accepted.type)) return;
       }
-      throw new StreamError('The exec stream ended before a terminal event; use events() to replay');
+      // A clean end without a terminal event is a dropped connection too.
+      throw new ConnectionError('The exec stream ended before a terminal event');
     } catch (error) {
       // Before exec.started arrives the exec id is unknown, so nothing can resume.
       if (execId === undefined || !resumable(error)) throw error;
     }
-    for await (const event of follow(this.#transport, this.id, { from: last + 1, signal, maxRetries: EXEC_RESUME_RETRIES })) {
+    for await (const event of follow(this.#transport, this.id, { from: last + 1, signal, maxRetries })) {
       const accepted = accept(event, true);
       if (!accepted) continue;
       yield accepted;
@@ -433,15 +449,22 @@ export class Machine {
     const output = { stdout: [] as Buffer[], stderr: [] as Buffer[] };
     const sizes = { stdout: 0, stderr: 0 };
     const errors: string[] = [];
+    let errorBytes = 0;
     for await (const event of this.execStream(cmd, options)) {
       if (event.type === 'exec.stdout' || event.type === 'exec.stderr') {
         const name = event.type === 'exec.stdout' ? 'stdout' : 'stderr';
         const bytes = Buffer.from(event.data, 'base64');
         sizes[name] += bytes.byteLength;
         if (sizes[name] > MAX_OUTPUT) throw new StreamError(`The exec's ${name} is larger than ${MAX_OUTPUT} bytes`);
-        output[name].push(bytes);
+        if (bytes.byteLength) output[name].push(bytes);
       }
-      if (event.type === 'exec.error') errors.push(event.message);
+      if (event.type === 'exec.error') {
+        errorBytes += Buffer.byteLength(event.message);
+        if (errors.length >= MAX_ERRORS || errorBytes > MAX_ERROR_BYTES) {
+          throw new StreamError(`The exec sent more than ${MAX_ERRORS} exec.error messages or ${MAX_ERROR_BYTES} bytes of them`);
+        }
+        errors.push(event.message);
+      }
       if (event.type === 'exec.failed' || event.type === 'machine.destroyed') {
         throw new ExecError(event.reason, event);
       }
