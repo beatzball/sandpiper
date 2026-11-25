@@ -152,7 +152,7 @@ The host writes a blank line on a quiet event stream every 30 seconds, so
 Node's 300-second idle body timeout does not end a long command. Older
 hosts do not. On them each quiet connection ends after 300 seconds and
 counts as a failed reconnect, so with the default `maxRetries` of 10 a
-command that prints nothing survives about 55 minutes. Pass a larger
+command that prints nothing survives about an hour. Pass a larger
 `maxRetries`, or `Infinity`, for longer quiet commands.
 
 ## Development
@@ -199,10 +199,17 @@ settings and add a trusted publisher:
 | repository | `sandpiper` |
 | workflow filename | `publish-client.yml` |
 | environment | `npm` |
+| allowed actions | tick **npm publish** (`npm stage publish` alone is the default for new publishers, and the workflow runs `npm publish`) |
 
 The first trusted publish must happen within 2 days of adding the
 publisher. In GitHub, give the `npm` environment a required reviewer and a
 deployment tag rule for `client-v*`.
+
+After the first real version ships, mark the placeholder so nobody installs it:
+
+```sh
+npm deprecate @beatzball/sandpiper-client@0.0.0-bootstrap.0 "placeholder for trusted publishing setup"
+```
 
 **Each release.** Set the version in `package.json`. In `CHANGELOG.md`,
 replace "unreleased" with the date. Merge to `main`, then push the tag
