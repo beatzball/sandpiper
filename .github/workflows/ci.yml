@@ -24,6 +24,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - name: The npm tarball holds exactly the files consumers need
+        run: npm run check:pack
 
   rust:
     runs-on: ubuntu-latest

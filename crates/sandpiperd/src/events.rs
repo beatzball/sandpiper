@@ -18,12 +18,19 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::sync::{broadcast, mpsc};
+use tokio::time::Instant;
 
 /// How long events are kept.
 pub const RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// Events read from the database per query while replaying.
 const PAGE: usize = 256;
+
+/// How long an event stream may stay silent before the host writes a blank
+/// line. HTTP clients drop a body that is idle for too long (Node's fetch
+/// after 300 s), and an exec may be quiet for up to an hour. Clients skip
+/// blank lines.
+pub const KEEPALIVE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Event {
@@ -256,6 +263,7 @@ impl Log {
 /// Stream `machine`'s events from `from` on as NDJSON: first from the
 /// database, then live. Only events that pass `keep` are sent; the stream
 /// ends after the first event that passes `last`, or when the client goes.
+/// A blank line goes out after [`KEEPALIVE`] without a write.
 pub fn follow(
     log: Arc<Log>,
     machine: String,
@@ -263,8 +271,22 @@ pub fn follow(
     keep: impl Fn(&Event) -> bool + Send + Sync + 'static,
     last: impl Fn(&Event) -> bool + Send + Sync + 'static,
 ) -> mpsc::Receiver<Result<Bytes, Infallible>> {
+    follow_every(log, machine, from, keep, last, KEEPALIVE)
+}
+
+fn follow_every(
+    log: Arc<Log>,
+    machine: String,
+    from: u64,
+    keep: impl Fn(&Event) -> bool + Send + Sync + 'static,
+    last: impl Fn(&Event) -> bool + Send + Sync + 'static,
+    keepalive: Duration,
+) -> mpsc::Receiver<Result<Bytes, Infallible>> {
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(async move {
+        // When the client last got a byte. Events for other machines, or
+        // ones `keep` drops, do not count.
+        let mut wrote = Instant::now();
         // Subscribe before reading the database, so nothing falls between.
         let mut live = log.subscribe();
         // A cursor past the end starts at the end: nothing was missed.
@@ -278,7 +300,11 @@ pub fn follow(
                 let _ = tx.send(Ok(stream_error(&e.to_string()))).await;
                 return;
             }
-            Err(_) => return,
+            // An empty stream means "past the end"; never send one by mistake.
+            Err(_) => {
+                let _ = tx.send(Ok(stream_error("event log read failed"))).await;
+                return;
+            }
         };
         let mut next = from.max(1).min(end + 1);
         'replay: loop {
@@ -292,12 +318,15 @@ pub fn follow(
                     let _ = tx.send(Ok(stream_error(&e.to_string()))).await;
                     return;
                 }
-                Err(_) => return,
+                Err(_) => {
+                    let _ = tx.send(Ok(stream_error("event log read failed"))).await;
+                    return;
+                }
             };
             let full = page.len() == PAGE;
             for e in &page {
                 next = e.seq + 1;
-                if emit(&tx, e, &keep, &last).await {
+                if emit(&tx, e, &keep, &last, &mut wrote).await {
                     return;
                 }
             }
@@ -319,12 +348,19 @@ pub fn follow(
                 let e = tokio::select! {
                     e = live.recv() => e,
                     () = tx.closed() => return,
+                    () = tokio::time::sleep_until(wrote + keepalive) => {
+                        if tx.send(Ok(Bytes::from_static(b"\n"))).await.is_err() {
+                            return;
+                        }
+                        wrote = Instant::now();
+                        continue;
+                    }
                 };
                 match e {
                     Ok(e) if e.machine != machine || e.seq < next => {}
                     Ok(e) if e.seq == next => {
                         next += 1;
-                        if emit(&tx, &e, &keep, &last).await {
+                        if emit(&tx, &e, &keep, &last, &mut wrote).await {
                             return;
                         }
                     }
@@ -354,9 +390,13 @@ async fn emit(
     e: &Event,
     keep: &(impl Fn(&Event) -> bool + Sync),
     last: &(impl Fn(&Event) -> bool + Sync),
+    wrote: &mut Instant,
 ) -> bool {
-    if keep(e) && tx.send(Ok(e.line())).await.is_err() {
-        return true;
+    if keep(e) {
+        if tx.send(Ok(e.line())).await.is_err() {
+            return true;
+        }
+        *wrote = Instant::now();
     }
     last(e)
 }
@@ -440,6 +480,57 @@ mod tests {
         let mut rx = follow(Arc::clone(&log), "a".into(), 9999, |_| true, |_| false);
         let ended = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
         assert!(matches!(ended, Ok(None)));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_stream_sends_blank_keepalive_lines() {
+        let (log, dir) = temp_log();
+        let log = Arc::new(log);
+        log.append("a", "exec.started", json!({})).unwrap();
+        let mut rx = follow_every(
+            Arc::clone(&log),
+            "a".into(),
+            1,
+            |e| e.kind != "exec.stdout",
+            |e| e.kind == "machine.destroyed",
+            Duration::from_millis(100),
+        );
+        let first = rx.recv().await.unwrap().unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&first).unwrap()["seq"], 1);
+        // Traffic the client never sees must not hold the keep-alive back:
+        // other machines' events and events `keep` drops.
+        let writer = Arc::clone(&log);
+        let noise = tokio::spawn(async move {
+            for _ in 0..30 {
+                writer.append("b", "exec.stdout", json!({})).unwrap();
+                writer.append("a", "exec.stdout", json!({})).unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a keep-alive within the interval")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&line[..], b"\n");
+        assert!(
+            !noise.is_finished(),
+            "the keep-alive waited for the noise to stop"
+        );
+        noise.await.unwrap();
+        log.append("a", "machine.destroyed", json!({})).unwrap();
+        let mut rest = Vec::new();
+        while let Some(Ok(line)) = rx.recv().await {
+            rest.push(line);
+        }
+        // Blank lines, then the last event, then the end.
+        let last = rest.pop().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&last).unwrap()["type"],
+            "machine.destroyed"
+        );
+        assert!(rest.iter().all(|l| &l[..] == b"\n"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
