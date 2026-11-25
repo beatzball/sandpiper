@@ -1,17 +1,19 @@
 name: publish-client
 
-# Publishes clients/ts to npm as @beatzball/sandpiper-client with provenance.
+# Publishes clients/ts to npm as @beatzball/sandpiper-client with provenance,
+# through npm trusted publishing (OIDC). There is no npm token.
 # Push a tag named client-v<version>, where <version> is the version in
 # clients/ts/package.json, for example client-v0.1.0. The tagged commit must
 # be on main. The job runs in the `npm` environment; give it a required
 # reviewer and limit it to client-v* tags in the repository settings.
+# The one-time setup on npmjs.com is in clients/ts/README.md, "Releases".
 on:
   push:
     tags: ['client-v*']
 
 permissions:
   contents: read
-  id-token: write # npm provenance
+  id-token: write # trusted publishing and provenance
 
 concurrency:
   group: publish-client
@@ -28,12 +30,21 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0 # for the ancestor check
+      # Node 24.7.0 ships npm 11.5.1, the first npm with trusted publishing.
+      # CI tests Node 22.18.0. No registry-url: that writes an .npmrc with a
+      # placeholder token, which trusted publishing does not need.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: '22.18.0'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: '24.7.0'
           cache: npm
           cache-dependency-path: clients/ts/package-lock.json
+      - name: npm supports trusted publishing
+        run: |
+          npm_version=$(npm --version)
+          if ! node -e 'const [a, b, c] = process.argv[1].split(".").map(Number); process.exit(a > 11 || (a === 11 && (b > 5 || (b === 5 && c >= 1))) ? 0 : 1)' "$npm_version"; then
+            echo "::error::npm $npm_version is older than 11.5.1"
+            exit 1
+          fi
       - name: The tag matches the package version
         run: |
           version=$(node -p "require('./package.json').version")
@@ -52,8 +63,8 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run check:pack
-      # Build here, then publish with --ignore-scripts, so no build code runs
-      # while NODE_AUTH_TOKEN is set.
+      # Build here, then publish with --ignore-scripts, so no package script
+      # runs during the publish itself.
       - run: npm run build
       - name: Publish
         run: |
@@ -64,5 +75,3 @@ jobs:
             *) tag=latest ;;
           esac
           npm publish --ignore-scripts --provenance --access public --tag "$tag"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

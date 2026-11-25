@@ -171,6 +171,44 @@ For a real host, set `SANDPIPER_URL` and `SANDPIPER_TOKEN`, then run
 [host setup](https://github.com/beatzball/sandpiper/blob/main/docs/host-setup.md#42-run-the-host-agent)
 for the daemon and Lima access from a Mac.
 
+## Releases
+
+Releases come from GitHub Actions through npm trusted publishing (OIDC), not
+from a laptop and not with an npm token. The workflow is
+`.github/workflows/publish-client.yml`. It runs in the GitHub environment
+`npm`, publishes with provenance, and needs npm 11.5.1 or later.
+
+**One-time setup.** npm adds a trusted publisher only to a package that
+already exists. So the owner publishes one placeholder by hand, once. From
+`clients/ts`, logged in to npm as an owner of `@beatzball`:
+
+```sh
+npm version 0.0.0-bootstrap.0 --no-git-tag-version
+npm publish --tag bootstrap --provenance=false --access public
+git checkout -- package.json package-lock.json
+```
+
+`--provenance=false` is needed because `publishConfig` asks for provenance,
+which only a CI run can make. Then, on npmjs.com, open the package's
+settings and add a trusted publisher:
+
+| field | value |
+|---|---|
+| publisher | GitHub Actions |
+| organization or user | `beatzball` |
+| repository | `sandpiper` |
+| workflow filename | `publish-client.yml` |
+| environment | `npm` |
+
+The first trusted publish must happen within 2 days of adding the
+publisher. In GitHub, give the `npm` environment a required reviewer and a
+deployment tag rule for `client-v*`.
+
+**Each release.** Set the version in `package.json`. In `CHANGELOG.md`,
+replace "unreleased" with the date. Merge to `main`, then push the tag
+`client-v<version>` on that commit. A version with a `-` (a prerelease)
+goes to the `next` dist-tag; others go to `latest`.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).

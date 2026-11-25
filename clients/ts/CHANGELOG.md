@@ -6,7 +6,7 @@ uses [semantic versioning](https://semver.org/). Before 1.0.0, a minor
 version can break the API.
 
 To release: replace "unreleased" with the date (YYYY-MM-DD), commit, then
-push the `client-v<version>` tag.
+push the `client-v<version>` tag. See "Releases" in the README.
 
 ## 0.1.0 - unreleased
 
